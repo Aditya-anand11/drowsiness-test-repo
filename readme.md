@@ -1,422 +1,313 @@
-# Full-Stack TypeScript Application
+# Driver-Drowsiness Detection — PyTorch Research Codebase
 
-## Overview
+This repository is a **Python / PyTorch machine-learning codebase for vision-based driver-drowsiness detection**. It contains data loading, several model families (2D CNN, residual CNN, an Inception-style CNN, a 3D CNN, an RNN/LSTM over sequences, and a VAE), a library of classical learning-rule helpers, a training script with an ablation-friendly optimizer factory, and an evaluation / benchmarking script.
 
-This project is a production-oriented full-stack TypeScript application. It exposes a versioned HTTP API, serves a React/Next.js web client, stores relational data in PostgreSQL through Prisma, uses Redis for caching and background jobs, and ships with Docker-based local and production workflows.
+> **Note on the previous README:** an earlier revision of this file described a "full-stack TypeScript application" (Next.js, Express, Prisma, PostgreSQL, Redis, BullMQ, Zod, pino). **None of that exists in this repository.** There is no TypeScript, no HTTP API, no database, and no web frontend here. This document was rewritten from a direct read of the actual `.py` sources.
 
-This README is the canonical architecture and implementation guide for the repository. It documents the high-level architecture, core technology choices, request lifecycle, module boundaries, implementation details, and the responsibility of each canonical source file. Replace angle-bracket placeholders with project-specific values.
+---
 
-The design follows a layered architecture: transport -> validation -> controller -> service -> repository -> persistence. Dependencies point inward. Controllers do not contain business logic. Services do not contain HTTP concerns. Repositories do not contain domain rules.
+## 1. Core technology
 
-## Architecture at a glance
+| Area | Technology actually used in the code | Where |
+| --- | --- | --- |
+| Deep learning | PyTorch — `torch`, `torch.nn`, `torch.nn.functional`, `torch.optim`, `torch.utils.data` | all model files, `train.py` |
+| Image I/O | Pillow (`PIL.Image`) | `dataloader.py` |
+| Dataset plumbing | `torchvision.datasets.ImageFolder`, `torchvision.transforms`, `random_split`, `ConcatDataset`, `DataLoader` | `dataloader.py` |
+| File discovery | `glob`, `os` | `dataloader.py` |
+| Metrics | scikit-learn — `accuracy_score`, `precision_score`, `recall_score`, `f1_score`, `confusion_matrix` | `evaluate.py` |
+| Numerics / PERCLOS | NumPy | `evaluate.py` |
+| Timing / FPS | `time` | `evaluate.py` |
+
+There is **no** `requirements.txt`, **no** test suite, **no** configuration file, and **no** model-checkpoint / logging infrastructure in the repository. Training hyperparameters are Python function defaults.
+
+---
+
+## 2. Architecture at a glance
 
 ```text
-Browser / mobile client
+ image folders on disk
+   "train"  "test"  (eye state: open / closed)
+   "no yawn"  "yawn"
         |
         v
-CDN + reverse proxy (TLS, compression, static assets)
+ dataloader.py
+   FolderImageDataset      -> (PIL image -> RGB -> transform), label 0/1
+   ImageFolder             -> torchvision folder dataset
+   get_transforms()        -> train (augmented) / test (resize+toTensor)
+   get_loaders()           -> random_split(80/20) + ConcatDataset -> DataLoader
+   SequenceDataset         -> synthetic (num_samples, seq_len=10, feature_dim=4)
         |
-        +--> Next.js web client (server components + client components)
-        |          |
-        |          v
-        |     API client (typed fetch, auth cookies, error decoding)
+        v   tensors (B, 3, 64, 64) and labels (B,)
         |
-        +--> Express API (/api/v1)
-                   |
-                   +--> request id -> security -> auth -> rate limit -> validation
-                   +--> controller -> service -> repository
-                   +--> PostgreSQL through Prisma
-                   +--> Redis for cache, sessions, and queues
-                   +--> worker process for asynchronous jobs
-                   +--> object storage for uploads
+        +--> models_cnn.py      CNN2D | ResNet | GoogLeNet | CNN3D | YOLOHead | focal_loss
+        +--> models_temporal.py TemporalRNN | TemporalLSTM  (input B, T=10, F=4)
+        +--> models_vae.py      VAE (encoder -> mu/logvar -> reparameterize -> decoder)
+        |
+        v
+ train.py
+   get_optimizer()            sgd | momentum | nesterov | adam (default), with weight_decay=l2
+   train_ablation_cnn()       BCE loss, per-epoch loss + train accuracy
+   train_temporal()           BCE loss on synthetic sequences
+   train_vae()                vae_loss_fn (BCE reconstruction + KL divergence)
+        |
+        v
+ evaluate.py
+   evaluate_model()           accuracy, precision, recall, F1, confusion matrix
+   benchmark_fps()            warm-up + timed loop -> FPS and latency (ms)
+   compute_perclos()          fraction of closed frames -> drowsiness flag
+
+ paradigms.py
+   hebbian_update | ojas_update | competitive_learning
+   error_correction_update | energy_function | energy_based_update
+   (standalone tensor-level learning rules; not wired into train.py)
 ```
 
-The API is stateless. Sessions or tokens are carried by HTTP-only cookies where possible. Long-running work is delegated to workers. PostgreSQL is the source of truth. Redis is never the source of truth; it is an optimization and coordination layer.
+The codebase is split strictly by concern: **data (`dataloader.py`) → models (`models_*.py`) → training (`train.py`) → measurement (`evaluate.py`)**, with `paradigms.py` kept as an independent library of low-level weight-update rules that does not participate in the main pipeline.
 
-## Core technology
+---
 
-| Area | Choice | Why it is used |
-| --- | --- | --- |
-| Runtime | Node.js 20 LTS | Stable runtime with strong TypeScript support |
-| Language | TypeScript strict mode | Compile-time safety across API, shared schemas, and UI |
-| API framework | Express | Small, explicit middleware pipeline and broad ecosystem |
-| ORM | Prisma | Typed database access, migrations, and relation handling |
-| Database | PostgreSQL | Transactions, constraints, indexes, and relational integrity |
-| Cache and queues | Redis + BullMQ | Caching, rate-limit state, sessions, and background jobs |
-| Frontend | Next.js App Router + React | Server rendering, routing, and client interactivity |
-| Styling | Tailwind CSS | Consistent design tokens and utility-first styling |
-| Validation | Zod | Runtime validation with inferred TypeScript types |
-| Auth | HTTP-only cookies with short-lived sessions | Reduced token exposure in browser JavaScript |
-| Logging | pino | Structured JSON logs with low overhead |
-| Testing | Vitest, Supertest, Playwright | Unit, integration, and end-to-end coverage |
-| Packaging | Docker and Docker Compose | Reproducible local and production environments |
-| CI/CD | GitHub Actions | Linting, type checks, tests, builds, and image publishing |
+## 3. Repository layout
 
-## Request lifecycle
+| File | Role |
+| --- | --- |
+| `dataloader.py` | Datasets, transforms, train/test splitting, `DataLoader` factories, synthetic sequence dataset |
+| `models_cnn.py` | Convolutional models and the focal-loss helper |
+| `models_temporal.py` | Recurrent models over per-frame feature sequences |
+| `models_vae.py` | Variational autoencoder for reconstruction / generation |
+| `paradigms.py` | Classical unsupervised & error-correction learning rules |
+| `train.py` | Optimizer factory and the three training routines |
+| `evaluate.py` | Classification metrics, FPS/latency benchmark, PERCLOS drowsiness rule |
+| `ARCHITECTURE.md` | Companion architecture note |
+| `readme.md` | This document |
 
-1. The client sends an HTTPS request to the reverse proxy or CDN.
-2. Static assets are served from the edge. API and page requests are forwarded to the application.
-3. The API assigns a request id and attaches it to the logger context.
-4. Security middleware sets headers, applies CORS rules, and rejects disallowed methods or origins.
-5. Auth middleware resolves the session or token and attaches the authenticated principal when present.
-6. Rate-limit middleware checks Redis-backed counters for sensitive routes.
-7. Validation middleware parses path, query, and body input with Zod schemas.
-8. The controller maps validated input to a service call and formats the HTTP response.
-9. The service applies domain rules, authorization checks, transactions, and idempotency.
-10. The repository performs typed persistence operations through Prisma.
-11. PostgreSQL returns data inside a transaction when required.
-12. The service may enqueue a background job and return a fast response.
-13. The response envelope returns data or a typed error. Errors include the request id for tracing.
-14. The worker consumes queued jobs and performs retries with backoff and dead-letter handling.
+---
 
-## Repository layout
+## 4. File-by-file implementation details
+
+### 4.1 `dataloader.py` — data ingestion
+
+**`FolderImageDataset(Dataset)`** — a generic two-folder binary dataset.
+
+- `__init__(class0_dir, class1_dir, transform=None)` globs `*.*` inside each directory and appends `(path, label)` pairs, with label **0** for `class0_dir` and **1** for `class1_dir`.
+- `__len__` returns the number of collected files.
+- `__getitem__(idx)` opens the file with Pillow, **forces `RGB`** (three channels — required by every CNN in the repo, which all start with a 3-channel convolution), applies the transform if present, and returns `(image, label)`.
+
+**`get_transforms(img_size=(64, 64), augment=True)`** returns a `(train_tf, test_tf)` pair.
+
+- With `augment=True` the training pipeline is `Resize(img_size) → RandomRotation(15) → RandomHorizontalFlip() → ColorJitter(brightness=0.2) → ToTensor()`.
+- With `augment=False` it is only `Resize(img_size) → ToTensor()`.
+- `test_tf` is always `Resize(img_size) → ToTensor()` (no augmentation, no normalization).
+- Because there is **no `Normalize`** step, inputs stay in `[0, 1]`; this is consistent with the VAE decoder, which ends in `Sigmoid`, and with `BCELoss` targets of 0/1.
+
+**`get_loaders(dataset_type="both", img_size=(64, 64), batch_size=32, augment=True)`** is the main data entry point.
+
+1. Builds `eye_train = ImageFolder("train", transform=train_tf)` and `eye_test = ImageFolder("test", transform=test_tf)` — the eye-state data uses torchvision's folder convention with `train/` and `test/` directories on disk.
+2. Builds `yawn_full = FolderImageDataset("no yawn", "yawn", transform=train_tf)` — note the yawn data uses two flat folders.
+3. Splits the yawn data 80/20 with `random_split(yawn_full, [yawn_train_len, yawn_test_len])`, where `yawn_train_len = int(0.8 * len(yawn_full))`.
+4. Selects the sets by `dataset_type`: `"eyes"` → eye folders only, `"yawn"` → the random split only, anything else (`"both"`, the default) → `ConcatDataset([eye_train, yawn_train])` and `ConcatDataset([eye_test, yawn_test])`.
+5. Wraps them in `DataLoader(train_set, batch_size=32, shuffle=True)` and `DataLoader(test_set, batch_size=32, shuffle=False)`.
+
+Implementation notes worth flagging:
+
+- The **yawn split uses `train_tf` for both halves**, so the yawn "test" set is *augmented*; and `random_split` consumes the global RNG, so the split differs on every run (no `generator=` and no seed).
+- Eye data has an explicit on-disk `test/` folder while yawn data is split programmatically — the two halves of `"both"` therefore have different leakage guarantees.
+- Directory arguments are **relative paths** (`"train"`, `"test"`, `"no yawn"`, `"yawn"`), so the process must be started from the project root.
+
+**`SequenceDataset(Dataset)`** — a *synthetic* sequence dataset, not real video data.
+
+- `X = torch.randn(num_samples=500, seq_len=10, feature_dim=4)` (pure Gaussian noise).
+- `y = (X[:, :, 0].mean(dim=1) > 0).float().unsqueeze(1)` — the label is the sign of the mean of the first feature over time, i.e. an exactly-learnable threshold rule on noise, giving an output shape `(B, 1)`.
+- `get_sequence_loader(batch_size=32)` wraps it in a shuffled `DataLoader`.
+
+### 4.2 `models_cnn.py` — convolutional models
+
+All image models take `(B, 3, H, W)` input (64×64 with the default transforms) and end in a `Sigmoid` producing a single probability per sample, matching the `BCELoss` used in `train.py` with `num_classes=1`.
+
+**`ResidualBlock(in_c, out_c)`** — two 3×3 convolutions with `padding=1`, each followed by `BatchNorm2d`, plus a projection shortcut (`1×1` conv + `BatchNorm2d`) that is only created when `in_c != out_c`. `forward` computes `res = shortcut(x)`, then `relu(bn1(conv1(x))) → bn2(conv2(...))`, and returns `relu(out + res)`.
+
+**`ResNet(num_classes=1)`** — a deliberately small hand-written ResNet: `init_conv` = `Conv2d(3, 32, k=7, stride=2, padding=3) → BatchNorm2d(32) → ReLU`, then `block1 = ResidualBlock(32, 32)`, `block2 = ResidualBlock(32, 64)`, `AdaptiveAvgPool2d((1,1))`, `Linear(64, num_classes)`, and `sigmoid` on the output. Downsampling happens only through the stride-2 stem and the global pooling — there are no max-pool stages.
+
+**`InceptionBlock(in_c, f1, f2, f3)`** — four parallel branches: a 1×1 conv (`f1`), a 3×3 conv with padding 1 (`f2`), a 5×5 conv with padding 2 (`f3`), and a `MaxPool2d(k=3, stride=1, padding=1)` followed by a 1×1 conv (`f1`). Each branch is ReLU-activated and the four outputs are concatenated along the channel dimension with `torch.cat([...], dim=1)`.
+
+**`GoogLeNet(num_classes=1)`** — a single-Inception-block network: `Conv2d(3, 32, k=3, padding=1) → ReLU → InceptionBlock(32, 16, 16, 16) → AdaptiveAvgPool2d((1,1)) → Linear(16*4, num_classes) → sigmoid`. The classifier input of `16*4 = 64` follows from the concatenation of the four branches (16+16+16+16). It is a very shallow "Inception-style" model, not the original deep GoogLeNet.
+
+**`CNN2D(use_bn=True, dropout=0.5, init_type="he")`** — the configurable model used for all ablations. Modules: `Conv2d(3, 32, k=3, padding=1)`, `BatchNorm2d(32)` (or `nn.Identity()` when `use_bn=False`), `Conv2d(32, 64, k=3, padding=1)`, `BatchNorm2d(64)`, a `Dropout(dropout)` (or `Identity` when `dropout <= 0`), `AdaptiveAvgPool2d((4, 4))`, `Linear(64*4*4, 32)`, and `Linear(32, 1)`. It exposes three ablation switches — normalization, dropout, and weight initialization — which are set by `_init_weights(init_type)`: `nn.Conv2d`/`nn.Linear` weights get `xavier_uniform_` for the `"xavier"` path and `kaiming_normal_(nonlinearity="relu")` otherwise (`"he"`), and every bias is zero-initialized.
+
+**`CNN3D(num_classes=1)`** — a volumetric/spatio-temporal model: `Conv3d(3, 16, k=(3,3,3), padding=1)`, `Conv3d(16, 32, k=(3,3,3), padding=1)`, `AdaptiveAvgPool3d((1,1,1))`, `Linear(32, num_classes)`. It expects a 5-D tensor `(B, C, T, H, W)` rather than a single image.
+
+**`YOLOHead(in_c=64, num_classes=3, num_anchors=2)`** — a single detection head implemented as `Conv2d(in_c, num_anchors * (5 + num_classes), kernel_size=1)`, i.e. `2 * (5 + 3) = 16` output channels per spatial location following the YOLO convention (`5` = box `x, y, w, h` + objectness). It is a building block only; there is no matching backbone, anchor assignment, or detection loss in the repository.
+
+**`focal_loss(preds, targets, alpha=0.25, gamma=2.0)`** — a helper implementing focal loss (down-weighting easy examples via `(1 - p_t)^gamma` scaled by `alpha`). It is defined in this module but is **not imported anywhere** — `train.py` uses plain `nn.BCELoss()`.
+
+### 4.3 `models_temporal.py` — sequence models
+
+Three activation helpers are defined for reference / experimentation: `step_activation` (binary threshold `(x >= 0).float()`), `sigmoid_activation`, and `tanh_activation`.
+
+**`TemporalRNN(input_dim=4, hidden_dim=32, num_classes=1)`** — an `nn.RNN(..., batch_first=True, nonlinearity="tanh")` followed by `Linear(hidden_dim, num_classes)`. `forward` runs the sequence, keeps only the final hidden state `h_n`, squeezes the layer axis, applies the linear layer and a `sigmoid`. Input shape: `(B, T, 4)`.
+
+**`TemporalLSTM(input_dim=4, hidden_dim=32, num_classes=1)`** — `nn.LSTM(batch_first=True)`, then `Dropout(0.2)` on the final hidden state `h_n`, then `Linear(hidden_dim, num_classes)` and `sigmoid`. Only the last hidden state is used (no attention, no per-timestep output). These feature sequences have the same 4-dimensional signature as `SequenceDataset`, i.e. the intended per-frame features are 4-D. Note that the LSTM does **not** set `input_size=...` from the constructor's `input_dim` positionally but forwards it correctly as the first positional argument.
+
+### 4.4 `models_vae.py` — variational autoencoder
+
+**`VAE(latent_dim=16)`**
+
+- **Encoder:** `Conv2d(3, 32, k=4, s=2, p=1) → ReLU → Conv2d(32, 64, k=4, s=2, p=1) → ReLU → Flatten`.
+- **Latent heads:** `fc_mu` and `fc_logvar`, both `Linear(64*16*16, latent_dim)`. This fixes the input resolution at **64×64** (two stride-2 convolutions turn 64→32→16, and `64 * 16 * 16 = 16384` features). Any other resolution will raise a shape error.
+- **Decoder:** `decoder_fc = Linear(latent_dim, 64*16*16)`, reshaped with `.view(-1, 64, 16, 16)`, then `ConvTranspose2d(64, 32, k=4, s=2, p=1) → ReLU → ConvTranspose2d(32, 3, k=4, s=2, p=1) → Sigmoid` (64×64 RGB output in `[0, 1]`).
+- **`reparameterize(mu, logvar)`** — the standard reparameterization trick: `std = exp(0.5*logvar)`, `eps ~ N(0, I)`, `z = mu + eps*std`.
+- **`forward(x)`** returns the triple `(recon_x, mu, logvar)`.
+- **`generate(num_samples=5, device="cpu")`** samples `z ~ N(0, I)` of width `self.fc_mu.out_features` and decodes it — the sampling path for new faces/eye images.
+
+**`vae_loss_fn(recon_x, x, mu, logvar)`** — `F.binary_cross_entropy(recon_x, x, reduction="sum")` plus the analytic KL term `-0.5 * sum(1 + logvar - mu^2 - exp(logvar))`, divided by the batch size `x.size(0)`. The BCE is *summed over pixels* while the KL is summed over latent units, so in practice the reconstruction term dominates early in training unless it is rescaled.
+
+### 4.5 `paradigms.py` — classical learning rules
+
+Standalone, framework-free tensor utilities (not imported by `train.py`):
+
+- **`hebbian_update(weights, x, y, lr=0.01)`** — `W + lr * outer(y, x)` (plain Hebbian potentiation).
+- **`ojas_update(weights, x, y, lr=0.01)`** — Hebbian term minus a decay term `(y²) * W`, keeping weight norms bounded (Oja's rule).
+- **`competitive_learning(weights, x, lr=0.1)`** — computes the Euclidean distance of the input to every prototype row, picks `argmin` (winner-take-all), moves that prototype toward the input with `lr * (x - w_winner)`, and returns `(weights, winner_index)`. The prototype row is updated **in place**.
+- **`error_correction_update(weights, bias, x, y_true, lr=0.05)`** — a perceptron step: predict `1` if `dot(w, x) + b >= 0` else `0`, compute `error = y_true - y_pred`, and apply `w += lr*error*x`, `b += lr*error`. Returns `(weights, bias, error)`.
+- **`energy_function(x, weights, bias)`** — the Hopfield-style quadratic energy `-0.5 * xᵀ W x - bᵀ x`.
+- **`energy_based_update(weights, bias, pos_data, neg_data, lr=0.01)`** — contrastive Hebbian update using the outer products of positive vs. negative samples, `W += lr*(outer(pos,pos) - outer(neg,neg))` and `b += lr*(pos - neg)`.
+
+### 4.6 `train.py` — training orchestration
+
+**`get_optimizer(model, opt_name="adam", lr=0.001, l2=0.0)`** — an optimizer factory used by the ablations:
+
+| `opt_name` | Optimizer |
+| --- | --- |
+| `"sgd"` | `SGD(lr, weight_decay=l2)` |
+| `"momentum"` | `SGD(lr, momentum=0.9, weight_decay=l2)` |
+| `"nesterov"` | `SGD(lr, momentum=0.9, nesterov=True, weight_decay=l2)` |
+| anything else (default) | `Adam(lr, weight_decay=l2)` |
+
+**`train_ablation_cnn(dataset_type="both", opt_name="adam", use_bn=True, dropout=0.5, l2=0.001, init_type="he", augment=True, epochs=3)`** — the main training loop.
+
+1. Selects CUDA when available, otherwise CPU.
+2. Builds loaders via `get_loaders(dataset_type, augment)` and the model `CNN2D(use_bn, dropout, init_type)`; optimizer via `get_optimizer(..., lr=0.001, l2=l2)`; loss `nn.BCELoss()`.
+3. For each epoch: `model.train()`, move `images` and `labels.float().unsqueeze(1)` to the device, zero gradients, forward, compute loss, backward, step.
+4. Accumulates loss and computes **train accuracy** by thresholding `outputs > 0.5` and comparing with the labels; prints `Epoch [i/epochs] Loss: … Acc: …`.
+5. Returns the trained model (no checkpoint is written to disk).
+
+The `opt_name`/`use_bn`/`dropout`/`l2`/`init_type`/`augment` arguments make this function a ready-made ablation harness — each call varies one design decision of the same architecture.
+
+**`train_temporal(epochs=5)`** — builds the synthetic sequence loader, a `TemporalLSTM`, `Adam(lr=0.001)` and `BCELoss`; each epoch runs the standard forward/loss/backward/step and prints the mean loss. No evaluation is performed.
+
+**`train_vae(dataset_type="both", epochs=3)`** — builds loaders with `augment=False` (reconstruction targets must be un-augmented), instantiates `VAE()` and `Adam(lr=0.001)`, then runs the reconstruction loop using `vae_loss_fn`. The VAE is trained on both classes of the same folders, i.e. it models the *distribution* of the eye/yawn patches rather than the label.
+
+### 4.7 `evaluate.py` — measurement
+
+**`evaluate_model(model, test_loader, device="cpu")`** — runs `model.eval()` under `torch.no_grad()`, thresholds outputs at `0.5`, flattens to 1-D, and returns a dict with `accuracy`, `precision`, `recall`, `f1` (all with `zero_division=0`) and the `confusion_matrix` from scikit-learn. Labels are taken from the loader's second element, so it works directly with the loaders from `dataloader.py`.
+
+**`benchmark_fps(model, input_shape=(1, 3, 64, 64), num_runs=50, device="cpu")`** — runs 5 warm-up forward passes on a random dummy input, then times `num_runs` forward passes with `time.time()`, returning `{"fps": num_runs/elapsed, "latency_ms": elapsed/num_runs*1000}`.
+
+**`compute_perclos(eye_states, threshold=0.8)`** — PERCLOS-style drowsiness rule: `closed_frames = sum(eye_states == 0)`, `perclos = closed_frames / len(eye_states)`, and `is_drowsy = perclos >= threshold`. It expects a sequence of 0/1 eye states where `0` means *closed*.
+
+**`__main__`** — instantiates `ResNet()` and `GoogLeNet()` and prints their FPS benchmarks on CPU, e.g.:
+
+```bash
+python evaluate.py
+```
+
+*(`get_loaders` is imported in this module but is not used by the current `__main__` block.)*
+
+---
+
+## 5. How to use the code
+
+Data is expected in the project root, **before** running anything:
 
 ```text
-.
-├── apps
-│   ├── api
-│   │   ├── src
-│   │   │   ├── app.ts
-│   │   │   ├── server.ts
-│   │   │   ├── config
-│   │   │   ├── controllers
-│   │   │   ├── db
-│   │   │   ├── jobs
-│   │   │   ├── middleware
-│   │   │   ├── repositories
-│   │   │   ├── routes
-│   │   │   ├── schemas
-│   │   │   ├── services
-│   │   │   ├── types
-│   │   │   └── utils
-│   │   └── prisma
-│   └── web
-│       ├── app
-│       ├── components
-│       ├── hooks
-│       ├── lib
-│       ├── store
-│       └── styles
-├── packages
-│   └── shared
-├── tests
-│   ├── unit
-│   ├── integration
-│   └── e2e
-├── scripts
-├── docs
-├── Dockerfile
-├── docker-compose.yml
-├── package.json
-├── tsconfig.json
-└── .env.example
+train/      # eyes, ImageFolder layout: train/open/*.png, train/closed/*.png
+test/       # eyes, ImageFolder layout: test/open/*.png,  test/closed/*.png
+no yawn/    # flat folder, label 0
+yawn/       # flat folder, label 1
 ```
 
-## Code and module reference
+Training (called directly from Python, since these are plain functions):
 
-### Root configuration and tooling
+```python
+from train import train_ablation_cnn, train_temporal, train_vae
+from evaluate import evaluate_model
 
-| File | Responsibility | Implementation notes |
-| --- | --- | --- |
-| `package.json` | Dependency graph, workspace scripts, and package metadata | Keep scripts small and composable: dev, build, test, lint, typecheck, db:migrate, db:seed. Pin major versions. |
-| `tsconfig.json` | TypeScript compiler configuration | Enable strict, noUncheckedIndexedAccess, exactOptionalPropertyTypes, and path aliases where useful. |
-| `eslint.config.js` | Static analysis rules | Enforce import order, no-floating-promises, consistent type imports, and framework-specific rules. |
-| `vitest.config.ts` | Unit and integration test configuration | Use separate projects or environment settings for node and jsdom tests. |
-| `playwright.config.ts` | Browser end-to-end test configuration | Start the app against a disposable database and deterministic seed data. |
-| `.env.example` | Documented environment contract | Never contains secrets. Lists every required variable with safe example values. |
-| `Dockerfile` | Production image build | Multi-stage build: install dependencies, build, prune dev dependencies, run as a non-root user. |
-| `docker-compose.yml` | Local dependency orchestration | Starts PostgreSQL, Redis, the API, the web app, and optionally a worker. Uses health checks and named volumes. |
+model = train_ablation_cnn(dataset_type="both", opt_name="nesterov",
+                           use_bn=True, dropout=0.5, l2=0.001,
+                           init_type="he", augment=True, epochs=3)
 
-### API bootstrap
+from dataloader import get_loaders
+_, test_loader = get_loaders(dataset_type="both", augment=False)
+print(evaluate_model(model, test_loader))
+```
 
-| File | Responsibility | Implementation notes |
-| --- | --- | --- |
-| `apps/api/src/server.ts` | Process entry point | Loads configuration, creates the HTTP server, registers graceful shutdown, and starts listening only after the database and Redis are reachable. |
-| `apps/api/src/app.ts` | Express application factory | Registers middleware, routes, error handling, and health checks. Exported separately from the server so tests can run without opening a port. |
-| `apps/api/src/config/env.ts` | Environment parsing | Validates environment variables with Zod at startup. Fails fast with a readable error when configuration is missing or malformed. |
-| `apps/api/src/config/logger.ts` | Structured logging | Creates a pino logger with redaction for authorization headers, cookies, passwords, and tokens. Adds request id child loggers. |
-| `apps/api/src/config/constants.ts` | Shared constants | Centralizes pagination defaults, cookie names, cache TTLs, and error codes. Avoids magic strings across modules. |
-
-### Database and persistence
-
-| File | Responsibility | Implementation notes |
-| --- | --- | --- |
-| `apps/api/src/db/client.ts` | Prisma client singleton | Reuses a single client in development to survive hot reload. Exposes a small wrapper for transactions and health checks. |
-| `apps/api/prisma/schema.prisma` | Data model and relation definitions | Defines models, enums, indexes, unique constraints, and relation behavior. Uses explicit mapping names for join tables. |
-| `apps/api/prisma/migrations/*` | Versioned schema changes | Generated by Prisma and reviewed before deployment. Never edited after being applied to shared environments. |
-| `apps/api/prisma/seed.ts` | Local and test seed data | Idempotent. Creates deterministic users, roles, and sample resources for development and end-to-end tests. |
-| `apps/api/src/db/health.ts` | Database readiness check | Runs a lightweight query and reports latency. Used by health endpoints and startup checks. |
-
-### Middleware
-
-| File | Responsibility | Implementation notes |
-| --- | --- | --- |
-| `apps/api/src/middleware/requestId.ts` | Request correlation | Reads an incoming request id or generates one, attaches it to the request, response header, and logger. |
-| `apps/api/src/middleware/security.ts` | HTTP hardening | Applies helmet headers, CORS allowlists, body size limits, and content-type checks. |
-| `apps/api/src/middleware/auth.ts` | Authentication | Resolves the session cookie or bearer token, verifies signature and expiry, and attaches the principal. Supports optional auth for public routes. |
-| `apps/api/src/middleware/authorize.ts` | Authorization | Checks roles, permissions, or resource ownership after authentication. Throws typed forbidden errors. |
-| `apps/api/src/middleware/validate.ts` | Input validation | Parses body, query, and params with Zod schemas. Replaces request input with parsed data and rejects unknown fields where appropriate. |
-| `apps/api/src/middleware/rateLimit.ts` | Abuse protection | Uses Redis-backed counters for login, registration, password reset, and write-heavy endpoints. Returns retry-after headers. |
-| `apps/api/src/middleware/errorHandler.ts` | Central error mapping | Converts AppError instances and unknown failures into a stable error envelope. Logs server errors with the request id. Does not leak stack traces in production. |
-| `apps/api/src/middleware/notFound.ts` | Unknown route handling | Returns a typed not-found error instead of an HTML default. |
-
-### Routing and controllers
-
-| File | Responsibility | Implementation notes |
-| --- | --- | --- |
-| `apps/api/src/routes/index.ts` | Route composition | Mounts versioned routers under `/api/v1`, health routes, and documentation routes. |
-| `apps/api/src/routes/<resource>.routes.ts` | Resource route definitions | Declares method, path, middleware chain, and controller handler. Contains no business logic. |
-| `apps/api/src/controllers/<resource>.controller.ts` | HTTP translation layer | Reads validated input, calls the service, maps results to status codes and response envelopes. Keeps handlers thin and testable. |
-| `apps/api/src/controllers/health.controller.ts` | Health endpoints | Reports liveness and readiness. Readiness checks database and Redis dependencies. |
-
-### Services and repositories
-
-| File | Responsibility | Implementation notes |
-| --- | --- | --- |
-| `apps/api/src/services/<resource>.service.ts` | Domain logic | Applies business rules, authorization checks, transactions, and idempotency. Throws typed AppError instances. Does not import Express types. |
-| `apps/api/src/services/auth.service.ts` | Authentication flows | Handles login, logout, session creation, password hashing, token rotation, and password reset. Uses constant-time comparison where relevant. |
-| `apps/api/src/repositories/<resource>.repository.ts` | Persistence boundary | Wraps Prisma queries for one aggregate. Accepts and returns domain-friendly types. Includes pagination, filtering, and soft-delete behavior. |
-| `apps/api/src/repositories/user.repository.ts` | User persistence | Finds users by email or id, creates users, updates password hashes, and loads roles or permissions. |
-| `apps/api/src/repositories/base.repository.ts` | Shared persistence helpers | Provides common pagination, count, and transaction helpers without hiding Prisma semantics. |
-
-### Schemas and shared types
-
-| File | Responsibility | Implementation notes |
-| --- | --- | --- |
-| `apps/api/src/schemas/<resource>.schema.ts` | Request validation schemas | Defines create, update, list, and id schemas with Zod. Exports inferred input types. |
-| `apps/api/src/schemas/common.schema.ts` | Reusable validation primitives | Pagination, ids, emails, dates, and sort parameters. |
-| `apps/api/src/types/<domain>.ts` | Domain types | Internal service and repository types that are not HTTP-specific. |
-| `packages/shared/src/*` | Cross-app contracts | Shared Zod schemas, API response types, and constants used by both API and web client. Keep this package framework-agnostic. |
-
-### Utilities
-
-| File | Responsibility | Implementation notes |
-| --- | --- | --- |
-| `apps/api/src/utils/errors.ts` | Error taxonomy | Defines AppError, validation errors, unauthorized, forbidden, not found, conflict, and internal errors. Includes stable error codes. |
-| `apps/api/src/utils/asyncHandler.ts` | Async route wrapper | Forwards rejected promises to the Express error handler. |
-| `apps/api/src/utils/pagination.ts` | Pagination helpers | Normalizes page and limit, builds metadata, and enforces maximum page size. |
-| `apps/api/src/utils/crypto.ts` | Hashing and token helpers | Password hashing, random token generation, and safe comparison helpers. |
-| `apps/api/src/utils/cache.ts` | Cache abstraction | Typed get, set, delete, and remember helpers with prefixes and TTLs. |
-| `apps/api/src/utils/idempotency.ts` | Idempotency support | Stores request keys for write endpoints and returns the original result for duplicates. |
-
-### Jobs and events
-
-| File | Responsibility | Implementation notes |
-| --- | --- | --- |
-| `apps/api/src/jobs/queue.ts` | Queue definitions | Creates BullMQ queues and shared connection options. Exports typed job names and payload schemas. |
-| `apps/api/src/jobs/workers/*.ts` | Background workers | Consume jobs, validate payloads, perform retry-safe work, and record failures. Workers are idempotent. |
-| `apps/api/src/jobs/scheduler.ts` | Recurring jobs | Registers cron-like jobs for cleanup, reconciliation, and notifications. |
-| `apps/api/src/events/*.ts` | Domain events | Decouples side effects such as email, audit logging, and cache invalidation from the request path. |
-
-### Web client
-
-| File | Responsibility | Implementation notes |
-| --- | --- | --- |
-| `apps/web/app/layout.tsx` | Root layout | Loads fonts, global styles, providers, and shared navigation. Keeps server-rendered structure stable. |
-| `apps/web/app/page.tsx` | Landing page | Server component that fetches public data and renders the initial view. |
-| `apps/web/app/(auth)/*` | Auth pages | Login, registration, and password reset flows. Uses shared Zod schemas and server actions or API calls. |
-| `apps/web/app/(dashboard)/*` | Authenticated application area | Uses route groups, layout-level auth checks, and server-side data loading. |
-| `apps/web/components/*` | Reusable UI | Presentational and interactive components. Server components by default; client components only when state or browser APIs are required. |
-| `apps/web/lib/api.ts` | API client | Centralizes base URL, credentials, headers, response parsing, and error decoding. Returns typed results. |
-| `apps/web/lib/auth.ts` | Client auth helpers | Reads session state, handles redirects, and exposes login and logout actions. |
-| `apps/web/hooks/*` | Reusable hooks | Data fetching, form state, debouncing, and UI behavior. No business logic that belongs in the API. |
-| `apps/web/store/*` | Client state | Holds only UI and session state. Server data is not duplicated into a global store. |
-| `apps/web/styles/globals.css` | Design tokens and global CSS | Tailwind layers, CSS variables, focus styles, and reduced-motion support. |
-
-### Tests, scripts, and docs
-
-| File | Responsibility | Implementation notes |
-| --- | --- | --- |
-| `tests/unit/*` | Unit tests | Test pure functions, schemas, services with mocked repositories, and utilities. |
-| `tests/integration/*` | Integration tests | Exercise HTTP routes against a disposable PostgreSQL database. Use Supertest and real middleware. |
-| `tests/e2e/*` | End-to-end tests | Playwright tests for critical user journeys against seeded data. |
-| `tests/fixtures/*` | Test data | Factories and deterministic fixtures. Avoid shared mutable state between tests. |
-| `scripts/*` | Operational scripts | Database reset, seed, migration checks, backup, and smoke-test helpers. |
-| `docs/*` | Supporting documentation | API examples, ADRs, runbooks, and incident procedures. |
-
-## Data model
-
-Core entities:
-
-- User: identity, email, password hash, status, timestamps, and optional profile fields.
-- Session: server-side session id, user id, expiry, user agent, and revocation state.
-- Role and Permission: authorization grants attached to users or groups.
-- Resource: the main domain aggregate. Replace with project-specific entities.
-- AuditLog: append-only record of sensitive actions with actor, action, target, and request id.
-- JobRecord: optional durable record of queued work for observability and replay.
-
-Rules:
-
-- Every table has a primary key, createdAt, and updatedAt.
-- Soft deletes use deletedAt only where recovery or audit requirements exist.
-- Unique constraints are enforced in the database, not only in application code.
-- Foreign keys use restrictive or cascading behavior deliberately.
-- Indexes cover foreign keys, common filters, and sort columns.
-- Transactions wrap multi-step writes in the service layer.
-
-## API design
-
-Canonical endpoints:
-
-- `GET /api/v1/health/live` returns process liveness.
-- `GET /api/v1/health/ready` checks database and Redis readiness.
-- `POST /api/v1/auth/login` authenticates and sets an HTTP-only session cookie.
-- `POST /api/v1/auth/logout` revokes the current session.
-- `GET /api/v1/auth/me` returns the current principal.
-- `GET /api/v1/<resource>` lists resources with pagination, filters, and sorting.
-- `POST /api/v1/<resource>` creates a resource.
-- `GET /api/v1/<resource>/:id` returns one resource.
-- `PATCH /api/v1/<resource>/:id` updates a resource.
-- `DELETE /api/v1/<resource>/:id` soft-deletes or hard-deletes according to policy.
-
-Response conventions:
-
-- Success responses use a stable envelope containing data and optional metadata.
-- List responses include items, page, limit, total, and hasNextPage.
-- Error responses include code, message, requestId, and optional field-level details.
-- Validation errors return 422 or 400 consistently.
-- Auth errors return 401. Authorization errors return 403. Missing resources return 404. Conflicts return 409.
-
-## Implementation details
-
-### Configuration and bootstrapping
-
-Configuration is parsed once at startup. The application refuses to start when required variables are missing or invalid. Secrets are never logged. The server starts only after dependency checks pass. Graceful shutdown stops accepting connections, drains the HTTP server, closes workers and queues, and disconnects Prisma and Redis.
-
-### API layer
-
-Controllers are intentionally thin. They translate HTTP input into service calls and service results into responses. Validation happens before controllers. Error handling happens after controllers. This keeps each layer replaceable and testable.
-
-### Persistence
-
-Repositories own Prisma access for one aggregate. Services own transactions and domain rules. Queries use select projections to avoid over-fetching. Pagination uses stable sort keys. N+1 queries are avoided with explicit includes or batched loaders. Migrations are reviewed and applied in CI and deployment pipelines before the new application version receives traffic.
-
-### Authentication and authorization
-
-Authentication resolves a session cookie or token, verifies expiry and revocation, and attaches a principal. Authorization checks roles, permissions, or ownership after authentication. Cookies are HTTP-only, secure in production, same-site where appropriate, and scoped to the API path. Sessions are rotated after privilege changes. Password reset tokens are single-use and time-bound.
-
-### Validation and errors
-
-Zod schemas are the single source of truth for request shape and inferred types. Unknown fields are rejected on write endpoints. Errors are represented as typed AppError instances with stable codes. The central error handler maps known errors to HTTP status codes and unknown errors to 500 without leaking internals. Every error log includes the request id.
-
-### Background jobs
-
-Writes that trigger slow side effects enqueue jobs instead of blocking the response. Job payloads are validated against schemas. Workers are idempotent and safe to retry. Failures use exponential backoff and eventually reach a dead-letter queue. Job records include request id, actor id, and attempt count for tracing.
-
-### Frontend
-
-Server components fetch initial data and render SEO-friendly markup. Client components handle local interactivity, optimistic updates, and browser APIs. The API client centralizes credentials and error decoding. Shared Zod schemas keep client and server validation aligned. Forms show field-level errors and disable submission while pending. Accessibility, keyboard navigation, and reduced-motion support are required for interactive components.
-
-### Security
-
-- Apply security headers and a strict content security policy where feasible.
-- Enforce CORS allowlists instead of wildcard origins in production.
-- Rate-limit authentication, registration, password reset, and write endpoints.
-- Validate and normalize all input at the boundary.
-- Use parameterized queries through Prisma. Never concatenate SQL.
-- Store only hashed passwords with a modern memory-hard algorithm.
-- Redact secrets, cookies, and authorization headers from logs.
-- Use least-privilege database and object-storage credentials.
-- Keep dependencies patched and run automated vulnerability scans in CI.
-
-### Observability
-
-- Structured JSON logs with request id, user id when present, route, status, and latency.
-- Health endpoints for liveness and readiness.
-- Metrics for request rate, error rate, latency, queue depth, job failures, and database pool usage.
-- Traces for inbound requests and outbound dependencies where supported.
-- Audit logs for authentication, authorization changes, and destructive operations.
-
-### Performance
-
-- Cache read-heavy, low-churn data in Redis with explicit TTLs and invalidation.
-- Use database indexes for common filters and sort orders.
-- Avoid over-fetching with Prisma select projections.
-- Stream or paginate large collections.
-- Move slow side effects to workers.
-- Use connection pooling and sensible pool limits.
-- Measure before optimizing. Keep performance changes behind benchmarks.
-
-## Environment variables
-
-| Variable | Purpose |
-| --- | --- |
-| `NODE_ENV` | Runtime mode: development, test, or production |
-| `PORT` | API port |
-| `DATABASE_URL` | PostgreSQL connection string |
-| `REDIS_URL` | Redis connection string |
-| `AUTH_SECRET` | Secret used for signing or encrypting session material |
-| `SESSION_COOKIE_NAME` | Name of the session cookie |
-| `CORS_ORIGINS` | Comma-separated allowlist of trusted origins |
-| `API_BASE_URL` | Public API base URL used by the web client |
-| `WEB_BASE_URL` | Public web base URL used for redirects and email links |
-| `LOG_LEVEL` | Logging verbosity |
-| `RATE_LIMIT_WINDOW_MS` | Rate-limit window size |
-| `RATE_LIMIT_MAX` | Maximum requests per window for protected routes |
-| `OBJECT_STORAGE_*` | Object-storage endpoint, bucket, and credentials |
-
-## Local development
+Benchmarking:
 
 ```bash
-cp .env.example .env
-docker compose up -d postgres redis
-npm install
-npm run db:migrate
-npm run db:seed
-npm run dev
+python evaluate.py
 ```
 
-Useful commands:
+Ablation grid (one factor at a time): `dataset_type ∈ {eyes, yawn, both}` × `opt_name ∈ {sgd, momentum, nesterov, adam}` × `use_bn ∈ {True, False}` × `dropout ∈ {0.0, 0.5}` × `l2 ∈ {0.0, 0.001}` × `init_type ∈ {he, xavier}` × `augment ∈ {True, False}`.
 
-```bash
-npm run lint
-npm run typecheck
-npm run test
-npm run test:integration
-npm run test:e2e
-npm run build
-```
+---
 
-## Testing strategy
+## 6. Will the model overfit?
 
-- Unit tests cover pure functions, schemas, utilities, and services with mocked repositories.
-- Integration tests cover HTTP routes, middleware, validation, authentication, error mapping, and real database behavior.
-- End-to-end tests cover critical user journeys in a browser against seeded data.
-- Tests must be deterministic and isolated. Each integration test run uses a disposable database or transaction rollback.
-- New behavior requires a failing test first when practical. Bug fixes include a regression test.
+Short answer: **it can, and with the current scripts you would not be able to tell.** Here is the grounded analysis, split by model family.
 
-## Deployment
+### 6.1 What the defaults already do to fight overfitting
 
-1. CI runs lint, typecheck, unit tests, integration tests, and build.
-2. Database migrations are applied before the new application version receives traffic.
-3. The API and worker images are built from the same source and deployed with health checks.
-4. The web client is built and deployed to the hosting platform or served by the Node runtime.
-5. Rolling deployment drains old instances through graceful shutdown.
-6. Smoke tests hit health endpoints and one read-only API route.
-7. Rollback uses the previous image tag and a compatible migration plan.
+`CNN2D` — the model used by the ablation harness — is the most regularized model in the repo:
 
-## Extension guide
+- **Dropout 0.5** before the classifier (`nn.Dropout(dropout)`, default `0.5`).
+- **BatchNorm** on both conv blocks (default `use_bn=True`).
+- **L2 weight decay** `0.001` (`get_optimizer(..., weight_decay=l2)`).
+- **He/Kaiming initialization** (`init_type="he"`), with a Xavier alternative.
+- **Data augmentation** in `get_transforms` — `RandomRotation(15)`, `RandomHorizontalFlip`, `ColorJitter(brightness=0.2)`.
+- **Aggressive downsampling of the feature map** — `AdaptiveAvgPool2d((4, 4))` then `Linear(64*4*4 → 32) → Linear(32 → 1)`, so the trainable head is tiny (≈ 33 K weights in `fc1`) and the whole model is small.
+- **Only 3 epochs** by default.
 
-To add a new resource:
+That combination — small model, small head, 3 epochs, dropout 0.5, augmentation, weight decay — makes catastrophic overfitting **unlikely**; if anything the more common failure mode here is **underfitting** (a 32-unit head after a 4×4 global-avg pool is a very narrow bottleneck).
 
-1. Add or update Prisma models and create a migration.
-2. Add Zod schemas for create, update, list, and id inputs.
-3. Add a repository for persistence.
-4. Add a service for domain rules and transactions.
-5. Add a controller for HTTP translation.
-6. Add routes and register them under `/api/v1`.
-7. Add integration tests for success, validation, auth, and error cases.
-8. Add UI routes and components if the resource is user-facing.
-9. Add metrics, audit events, and background jobs for side effects.
-10. Update this README and any API documentation.
+### 6.2 Where overfitting is still likely
 
-## Glossary
+1. **The generalization gap is never measured during training.** `train_ablation_cnn` evaluates *only* the training set (`acc = correct / total` inside the training loop) and never touches `test_loader` — the loader it receives but only unpacks and discards (`train_loader, test_loader = get_loaders(...)`; `test_loader` is never used). There is no validation split, no per-epoch test metric, no early stopping, and no saved best checkpoint. So even if the model overfits, nothing in the run reports it.
+2. **Small datasets + heavy augmentation = augmented-only validation.** For the yawn half of `"both"`, `get_loaders` applies `train_tf` to `yawn_full` *before* the 80/20 `random_split`, so the "test" yawn images are randomly rotated/flipped/brightness-jittered too. Reported test accuracy on those samples is neither clean nor comparable across runs.
+3. **Non-repeatable splits.** `random_split` uses the global RNG with no `generator=` and there is no `torch.manual_seed(...)` anywhere, so the yawn train/test split changes per run — metrics are not reproducible, and a lucky split can look like a good model.
+4. **Potential identity leakage between the eye halves.** The eye data relies on `train/` and `test/` being genuinely disjoint on disk (per-driver/per-session). The code does not verify this; if frames from the same video end up on both sides, the reported accuracy will be optimistic regardless of architecture.
+5. **Class imbalance is unhandled.** `FolderImageDataset` and `ImageFolder` count whatever files exist; there is no `WeightedRandomSampler`, no `pos_weight`, and `BCELoss` is unweighted. With `nofault`-heavy folders, accuracy is dominated by the majority class — `precision`/`recall`/`F1` in `evaluate_model` exist precisely to expose this, but nothing in training optimizes for it.
 
-- Aggregate: a consistency boundary around one domain object and its related data.
-- Controller: HTTP adapter that translates requests and responses.
-- Repository: persistence adapter for one aggregate.
-- Service: domain layer that enforces rules and coordinates transactions.
-- Idempotency: the property that repeating the same request produces the same result.
-- Readiness: whether the application can serve traffic, including dependencies.
-- Liveness: whether the process is running.
-- Dead-letter queue: storage for jobs that exhausted retries.
+### 6.3 Per-model verdict
+
+| Model | Overfitting risk | Reasoning from the code |
+| --- | --- | --- |
+| `CNN2D` | **Low to moderate** | Dropout 0.5 + BN + weight decay 0.001 + augmentation + tiny `fc1`/`fc2` head + 3 epochs. Risk rises if `dropout=0.0`, `augment=False` and `l2=0.0` are chosen in the ablation grid — that configuration is effectively unregularized and *will* overfit on a small set. |
+| `ResNet` | **Low (capacity-limited)** | Only two residual blocks, 32/64 channels, a single global-average-pool, and a `Linear(64 → 1)` head. Very few parameters and **no dropout**; the realistic failure mode is underfitting, not overfitting. |
+| `GoogLeNet` | **Low (capacity-limited)** | One Inception block, no batch-norm, no dropout, and a `Linear(64 → 1)` classifier fed by global average pooling. Again, underfitting is the more likely failure. |
+| `TemporalRNN` / `TemporalLSTM` | **Meaningless on the current data** | Trained on `SequenceDataset`, which is i.i.d. Gaussian noise with a threshold label. There is no real temporal signal to memorize beyond the `mean(feature 0) > 0` rule, so the model converges to a near-trivial decision boundary; the LSTM's `Dropout(0.2)` and 32-unit hidden state are far more than that rule needs. Any reported loss is not evidence about driving behaviour. |
+| `CNN3D` | **Untested** | Three conv layers/16→32 channels and a `Linear(32 → 1)` head. There is no 3-D dataloader in the repo, so it cannot currently be trained at all — overfitting is moot until video tensors exist. |
+| `VAE` | **Moderate to high (memorization)** | A 16-D latent for 64×64 RGB patches is a strong bottleneck, which limits memorization; however the loss is `sum(BCE)/batch + KL`, which is dominated by the reconstruction term, so the model can under-regularize its KL and behave close to a plain autoencoder (memorizing the training frames). Nothing monitors the ELBO on held-out images. |
+| `paradigms.py` rules | **N/A** | Pure tensor update rules; they are never trained by the pipeline. |
+
+### 6.4 Concrete recommendations
+
+1. Add a **validation split** and log train **and** validation loss/F1 every epoch; the code already returns the model, so `evaluate_model` can be called on a validation loader between epochs.
+2. Add `torch.manual_seed(...)` and pass `generator=torch.Generator().manual_seed(seed)` to `random_split` for reproducible, comparable ablations.
+3. Use `test_tf` for the yawn test half — split the **dataset paths first**, then apply the train transform to the train subset only.
+4. Track the **gap** `train_acc − test_f1` across the ablation grid; a widening gap is the overfitting signal the current instrumentation is missing.
+5. Consider class weighting (`pos_weight`) or a weighted sampler if the eye/yawn folders are imbalanced, and report precision/recall/F1 rather than accuracy alone.
+6. For the VAE, weight the KL term (e.g. β-VAE) or normalize BCE per pixel, and monitor reconstruction error on unseen frames.
+
+---
+
+## 7. Known limitations and caveats
+
+- **No dependencies manifest.** Install manually: `torch`, `torchvision`, `Pillow`, `numpy`, `scikit-learn`.
+- **No tests, no CI, no seeding, no checkpointing, no logging framework.** All hyperparameters are function defaults.
+- **`train.py` exposes functions only** — there is no top-level `argparse`/CLI, so experiments are driven from a Python REPL or a driver script.
+- **`focal_loss` in `models_cnn.py` is dead code** (never imported); every training loop uses `nn.BCELoss()`.
+- **`YOLOHead` has no backbone, anchors, or detection loss**, and `CNN3D` has no 3-D data loader — both are building blocks for future work.
+- **`benchmark_fps` does not call `torch.cuda.synchronize()`**, so on GPU the reported FPS/latency is measured asynchronously and can be optimistic.
+- **`compute_perclos` uses a default threshold of `0.8`** (80 % of frames closed) and counts `eye_states == 0` as closed; both the convention and the threshold must match the eye-classifier's label convention (`ImageFolder` sorts folders alphabetically, so "closed" vs "open" ordering determines which label means closed).
+- **Input-resolution coupling:** the VAE hard-codes 64×64; the CNNs adapt via pooling but were designed around `img_size=(64, 64)`.
+- **`evaluate.py` imports `get_loaders` but `__main__` only benchmarks models.**
+- **No normalization layer** in the transforms — inputs stay in `[0, 1]`, which the sigmoid-output models and the VAE reconstruction loss assume.
