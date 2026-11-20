@@ -24,23 +24,30 @@ class FolderImageDataset(Dataset):
             image = self.transform(image)
         return image, label
 
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
 def get_transforms(img_size=(64, 64), augment=True):
+    normalize = transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
     if augment:
         train_tf = transforms.Compose([
             transforms.Resize(img_size),
             transforms.RandomRotation(15),
             transforms.RandomHorizontalFlip(),
             transforms.ColorJitter(brightness=0.2),
-            transforms.ToTensor()
+            transforms.ToTensor(),
+            normalize
         ])
     else:
         train_tf = transforms.Compose([
             transforms.Resize(img_size),
-            transforms.ToTensor()
+            transforms.ToTensor(),
+            normalize
         ])
     test_tf = transforms.Compose([
         transforms.Resize(img_size),
-        transforms.ToTensor()
+        transforms.ToTensor(),
+        normalize
     ])
     return train_tf, test_tf
 
