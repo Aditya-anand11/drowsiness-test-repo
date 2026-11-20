@@ -1,8 +1,8 @@
-# <PROJECT_NAME>
+# Full-Stack TypeScript Application
 
 ## Overview
 
-<PROJECT_NAME> is a production-oriented full-stack TypeScript application. It exposes a versioned HTTP API, serves a React/Next.js web client, stores relational data in PostgreSQL through Prisma, uses Redis for caching and background jobs, and ships with Docker-based local and production workflows.
+This project is a production-oriented full-stack TypeScript application. It exposes a versioned HTTP API, serves a React/Next.js web client, stores relational data in PostgreSQL through Prisma, uses Redis for caching and background jobs, and ships with Docker-based local and production workflows.
 
 This README is the canonical architecture and implementation guide for the repository. It documents the high-level architecture, core technology choices, request lifecycle, module boundaries, implementation details, and the responsibility of each canonical source file. Replace angle-bracket placeholders with project-specific values.
 
