@@ -1,3 +1,5 @@
+import random
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -5,6 +7,18 @@ from dataloader import get_loaders, get_sequence_loader
 from models_cnn import CNN2D
 from models_temporal import TemporalLSTM
 from models_vae import VAE, vae_loss_fn
+
+def set_seed(seed=42):
+    """Seed all RNGs so training is reproducible regardless of external state."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    # Deterministic cuDNN where available for stable runs.
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    return seed
 
 def get_optimizer(model, opt_name="adam", lr=0.001, l2=0.0):
     if opt_name == "sgd":
@@ -21,6 +35,9 @@ def train_ablation_cnn(dataset_type="both", opt_name="adam", use_bn=True, dropou
     model = CNN2D(use_bn=use_bn, dropout=dropout, init_type=init_type).to(device)
     optimizer = get_optimizer(model, opt_name=opt_name, lr=0.001, l2=l2)
     criterion = nn.BCELoss()
+
+    if len(train_loader) == 0:
+        raise ValueError("Empty training loader; check dataset directories.")
 
     for epoch in range(epochs):
         model.train()
@@ -47,6 +64,9 @@ def train_temporal(epochs=5):
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     criterion = nn.BCELoss()
 
+    if len(loader) == 0:
+        raise ValueError("Empty sequence loader.")
+
     for epoch in range(epochs):
         model.train()
         total_loss = 0
@@ -67,8 +87,22 @@ def train_vae(dataset_type="both", epochs=3):
     model = VAE().to(device)
     optimizer = optim.Adam(model.parameters(), lr=0.001)
 
+    if len(train_loader) == 0:
+        raise ValueError("Empty training loader; check dataset directories.")
+
     for epoch in range(epochs):
         model.train()
+        total_loss = 0.0
+        for images, _ in train_loader:
+            images = images.to(device)
+            optimizer.zero_grad()
+            recon_x, mu, logvar = model(images)
+            loss = vae_loss_fn(recon_x, images, mu, logvar)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        print(f"VAE Epoch [{epoch+1}/{epochs}] Loss: {total_loss/len(train_loader):.4f}")
+    return model
         total_loss = 0
         for images, _ in train_loader:
             images = images.to(device)
