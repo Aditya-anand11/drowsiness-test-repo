@@ -16,8 +16,22 @@
 > `benchmark.py` benchmarks `CNN2D`, `ResNet` and `GoogLeNet` from
 > `models_cnn.py` on a `(batch, 3, 64, 64)` input and, with `--train-steps`,
 > times real `CNN2D` optimization steps (BCE loss, labels shaped `(B, 1)` as in
-> `train.py`). It prints a table and can dump a JSON report. Training itself is
-> still launched through `train.py`.
+> `train.py`). It prints a table and can dump a JSON report.
+>
+> **Training launcher.** Use `run_training.py` to actually train a model:
+>
+> ```bash
+> python run_training.py --dry-run          # wiring check; no torch needed
+> python run_training.py --model cnn        # CNN2D via train.train_ablation_cnn
+> python run_training.py --model temporal   # LSTM via train.train_temporal
+> python run_training.py --model vae        # VAE via train.train_vae
+> ```
+>
+> **TensorFlow is not used by this repo.** Every model
+> (`models_cnn.py`, `models_temporal.py`, `models_vae.py`) is PyTorch, so
+> installing TensorFlow would add hundreds of MB without training anything.
+> Only `torch` + `torchvision` are required, and they cannot be installed in
+> the restricted sandbox — hence the standalone script + this note.
 
 This repository is a **Python / PyTorch machine-learning codebase for vision-based driver-drowsiness detection**. It contains data loading, several model families (2D CNN, residual CNN, an Inception-style CNN, a 3D CNN, an RNN/LSTM over sequences, and a VAE), a library of classical learning-rule helpers, a training script with an ablation-friendly optimizer factory, and an evaluation / benchmarking script.
 
