@@ -1,5 +1,24 @@
 # Driver-Drowsiness Detection — PyTorch Research Codebase
 
+> **Benchmarking / training on a real machine.** This repo ships a standalone
+> benchmark harness, `benchmark.py`, plus `requirements.txt`. It is *not* wired
+> into CI on purpose: `torch`/`torchvision` are heavy dependencies that cannot be
+> installed in the restricted sandbox. To run it on a dedicated machine:
+>
+> ```bash
+> pip install -r requirements.txt \
+>   --extra-index-url https://download.pytorch.org/whl/cpu   # CPU-only torch
+> python benchmark.py --dry-run                  # wiring check, no torch needed
+> python benchmark.py --batch-size 8 --runs 50    # inference FPS / latency
+> python benchmark.py --train-steps 20 --json bench.json   # + timed training steps
+> ```
+>
+> `benchmark.py` benchmarks `CNN2D`, `ResNet` and `GoogLeNet` from
+> `models_cnn.py` on a `(batch, 3, 64, 64)` input and, with `--train-steps`,
+> times real `CNN2D` optimization steps (BCE loss, labels shaped `(B, 1)` as in
+> `train.py`). It prints a table and can dump a JSON report. Training itself is
+> still launched through `train.py`.
+
 This repository is a **Python / PyTorch machine-learning codebase for vision-based driver-drowsiness detection**. It contains data loading, several model families (2D CNN, residual CNN, an Inception-style CNN, a 3D CNN, an RNN/LSTM over sequences, and a VAE), a library of classical learning-rule helpers, a training script with an ablation-friendly optimizer factory, and an evaluation / benchmarking script.
 
 > **Note on the previous README:** an earlier revision of this file described a "full-stack TypeScript application" (Next.js, Express, Prisma, PostgreSQL, Redis, BullMQ, Zod, pino). **None of that exists in this repository.** There is no TypeScript, no HTTP API, no database, and no web frontend here. This document was rewritten from a direct read of the actual `.py` sources.
