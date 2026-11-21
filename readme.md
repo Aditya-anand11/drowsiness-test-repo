@@ -1,41 +1,8 @@
 # Driver-Drowsiness Detection — PyTorch Research Codebase
 
-> **Benchmarking / training on a real machine.** This repo ships a standalone
-> benchmark harness, `benchmark.py`, plus `requirements.txt`. It is *not* wired
-> into CI on purpose: `torch`/`torchvision` are heavy dependencies that cannot be
-> installed in the restricted sandbox. To run it on a dedicated machine:
->
-> ```bash
-> pip install -r requirements.txt \
->   --extra-index-url https://download.pytorch.org/whl/cpu   # CPU-only torch
-> python benchmark.py --dry-run                  # wiring check, no torch needed
-> python benchmark.py --batch-size 8 --runs 50    # inference FPS / latency
-> python benchmark.py --train-steps 20 --json bench.json   # + timed training steps
-> ```
->
-> `benchmark.py` benchmarks `CNN2D`, `ResNet` and `GoogLeNet` from
-> `models_cnn.py` on a `(batch, 3, 64, 64)` input and, with `--train-steps`,
-> times real `CNN2D` optimization steps (BCE loss, labels shaped `(B, 1)` as in
-> `train.py`). It prints a table and can dump a JSON report.
->
-> **Training launcher.** Use `run_training.py` to actually train a model:
->
-> ```bash
-> python run_training.py --dry-run          # wiring check; no torch needed
-> python run_training.py --model cnn        # CNN2D via train.train_ablation_cnn
-> python run_training.py --model temporal   # LSTM via train.train_temporal
-> python run_training.py --model vae        # VAE via train.train_vae
-> ```
->
-> **TensorFlow is not used by this repo.** Every model
-> (`models_cnn.py`, `models_temporal.py`, `models_vae.py`) is PyTorch, so
-> installing TensorFlow would add hundreds of MB without training anything.
-> Only `torch` + `torchvision` are required, and they cannot be installed in
-> the restricted sandbox — hence the standalone script + this note.
+This repository is a **Python / PyTorch machine-learning codebase for vision-based driver-drowsiness detection**. It contains image and sequence data loading, several CNN/RNN/VAE model families, a set of standalone classical-learning-rule helpers, a training script with an ablation-friendly optimizer factory, and an evaluation / benchmarking script plus standalone run harnesses.
 
-This repository is a **Python / PyTorch machine-learning codebase for vision-based driver-drowsiness detection**. It contains data loading, several model families (2D CNN, residual CNN, an Inception-style CNN, a 3D CNN, an RNN/LSTM over sequences, and a VAE), a library of classical learning-rule helpers, a training script with an ablation-friendly optimizer factory, and an evaluation / benchmarking script.
-
-> **Note on the previous README:** an earlier revision of this file described a "full-stack TypeScript application" (Next.js, Express, Prisma, PostgreSQL, Redis, BullMQ, Zod, pino). **None of that exists in this repository.** There is no TypeScript, no HTTP API, no database, and no web frontend here. This document was rewritten from a direct read of the actual `.py` sources.
+> **Note on earlier revisions of this file.** A previous version of this README described a full-stack TypeScript application (Next.js, Express, Prisma, PostgreSQL, Redis, BullMQ, Zod, pino). **None of that technology exists in this repository.** There is no TypeScript, no HTTP API, no database and no web frontend here. Everything below is derived from a direct read of the actual `.py` sources.
 
 ---
 
@@ -43,304 +10,184 @@ This repository is a **Python / PyTorch machine-learning codebase for vision-bas
 
 | Area | Technology actually used in the code | Where |
 | --- | --- | --- |
-| Deep learning | PyTorch — `torch`, `torch.nn`, `torch.nn.functional`, `torch.optim`, `torch.utils.data` | all model files, `train.py` |
+| Deep learning | PyTorch — `torch`, `torch.nn`, `torch.nn.functional`, `torch.optim`, `torch.utils.data` | model files, `train.py`, `dataloader.py`, `evaluate.py` |
 | Image I/O | Pillow (`PIL.Image`) | `dataloader.py` |
-| Dataset plumbing | `torchvision.datasets.ImageFolder`, `torchvision.transforms`, `random_split`, `ConcatDataset`, `DataLoader` | `dataloader.py` |
-| File discovery | `glob`, `os` | `dataloader.py` |
-| Metrics | scikit-learn — `accuracy_score`, `precision_score`, `recall_score`, `f1_score`, `confusion_matrix` | `evaluate.py` |
+| Dataset plumbing | `torchvision.datasets.ImageFolder`, `torchvision.transforms`, `random_split`, `DataLoader` | `dataloader.py` |
+| Metrics | scikit-learn (`accuracy_score`, `precision_score`, `recall_score`, `f1_score`, `confusion_matrix`) | `evaluate.py` |
 | Numerics / PERCLOS | NumPy | `evaluate.py` |
-| Timing / FPS | `time` | `evaluate.py` |
+| Standard library | `os`, `glob`, `time`, `argparse`, `json`, `platform`, `sys`, `importlib` | data/eval/harness scripts |
 
-There is **no** `requirements.txt`, **no** test suite, **no** configuration file, and **no** model-checkpoint / logging infrastructure in the repository. Training hyperparameters are Python function defaults.
+There is **no** TensorFlow, no CUDA-only path (device selection falls back to CPU), no web framework, no database, and no test suite in the repository. Training hyper-parameters are Python function defaults, not a config file.
 
 ---
 
-## 2. Architecture at a glance
+## 2. High-level architecture
 
 ```text
- image folders on disk
-   "train"  "test"  (eye state: open / closed)
-   "no yawn"  "yawn"
+ image folders on disk ("train", "test", "no yawn", "yawn")
         |
         v
- dataloader.py
-   FolderImageDataset      -> (PIL image -> RGB -> transform), label 0/1
-   ImageFolder             -> torchvision folder dataset
-   get_transforms()        -> train (augmented) / test (resize+toTensor)
-   get_loaders()           -> random_split(80/20) + ConcatDataset -> DataLoader
-   SequenceDataset         -> synthetic (num_samples, seq_len=10, feature_dim=4)
-        |
-        v   tensors (B, 3, 64, 64) and labels (B,)
-        |
-        +--> models_cnn.py      CNN2D | ResNet | GoogLeNet | CNN3D | YOLOHead | focal_loss
-        +--> models_temporal.py TemporalRNN | TemporalLSTM  (input B, T=10, F=4)
-        +--> models_vae.py      VAE (encoder -> mu/logvar -> reparameterize -> decoder)
+ dataloader.py   FolderImageDataset / ImageFolder + transforms + random_split
+        |         -> DataLoader batches (images, labels) and synthetic sequences
+        v
+ models_cnn.py       CNN2D | ResNet(ResidualBlock) | GoogLeNet(InceptionBlock)
+                     | CNN3D | YOLOHead | focal_loss
+ models_temporal.py  TemporalRNN | TemporalLSTM   (input B, T=10, F=4)
+ models_vae.py       VAE (conv encoder / transposed-conv decoder) + vae_loss_fn
+ paradigms.py        standalone learning-rule utilities (Hebbian, Oja, competitive,
+                     error-correction, energy-based) on plain tensors
         |
         v
- train.py
-   get_optimizer()            sgd | momentum | nesterov | adam (default), with weight_decay=l2
-   train_ablation_cnn()       BCE loss, per-epoch loss + train accuracy
-   train_temporal()           BCE loss on synthetic sequences
-   train_vae()                vae_loss_fn (BCE reconstruction + KL divergence)
+ train.py        optimizer factory + training loops (BCE loss / VAE loss)
         |
         v
- evaluate.py
-   evaluate_model()           accuracy, precision, recall, F1, confusion matrix
-   benchmark_fps()            warm-up + timed loop -> FPS and latency (ms)
-   compute_perclos()          fraction of closed frames -> drowsiness flag
+ evaluate.py     accuracy / precision / recall / F1 / confusion matrix,
+                 FPS & latency benchmark, PERCLOS drowsiness rule
 
- paradigms.py
-   hebbian_update | ojas_update | competitive_learning
-   error_correction_update | energy_function | energy_based_update
-   (standalone tensor-level learning rules; not wired into train.py)
+ benchmark.py     standalone inference-FPS / training-step harness (lazy torch import)
+ run_training.py  standalone training launcher (lazy torch import)
 ```
 
-The codebase is split strictly by concern: **data (`dataloader.py`) → models (`models_*.py`) → training (`train.py`) → measurement (`evaluate.py`)**, with `paradigms.py` kept as an independent library of low-level weight-update rules that does not participate in the main pipeline.
+The codebase is split strictly by concern: **data (`dataloader.py`) -> models (`models_*.py`) -> training (`train.py`) -> measurement (`evaluate.py`)**, with `paradigms.py` kept independent of the training pipeline and the two harness scripts (`benchmark.py`, `run_training.py`) kept independent of the sandbox.
+
+### End-to-end data flow
+
+1. `dataloader.get_loaders` builds a training loader and a test loader. Eye-state data comes from `torchvision.datasets.ImageFolder("train")` and `ImageFolder("test")`; yawn data is listed once by `FolderImageDataset("no yawn", "yawn")` and split 80/20 with `random_split`, then wrapped in `TransformedSubset` so train and test halves can use *different* transforms.
+2. Images are resized to `64x64`, optionally augmented (`RandomRotation(15)`, `RandomHorizontalFlip`, `ColorJitter(brightness=0.2)`) for training only, then converted to tensors.
+3. `train.py` moves batches to the selected device, runs the model, computes `BCELoss` against labels reshaped to `(B, 1)`, back-propagates and steps the optimizer chosen by `get_optimizer`.
+4. `evaluate.py` runs the model in `eval()` mode under `torch.no_grad()`, thresholds probabilities at `0.5`, and reports sklearn metrics plus a confusion matrix. `benchmark_fps` times repeated forward passes for throughput/latency, and `compute_perclos` turns a sequence of eye states into a PERCLOS ratio and a drowsiness boolean.
 
 ---
 
-## 3. Repository layout
+## 3. File-by-file implementation details
 
-| File | Role |
-| --- | --- |
-| `dataloader.py` | Datasets, transforms, train/test splitting, `DataLoader` factories, synthetic sequence dataset |
-| `models_cnn.py` | Convolutional models and the focal-loss helper |
-| `models_temporal.py` | Recurrent models over per-frame feature sequences |
-| `models_vae.py` | Variational autoencoder for reconstruction / generation |
-| `paradigms.py` | Classical unsupervised & error-correction learning rules |
-| `train.py` | Optimizer factory and the three training routines |
-| `evaluate.py` | Classification metrics, FPS/latency benchmark, PERCLOS drowsiness rule |
-| `ARCHITECTURE.md` | Companion architecture note |
-| `readme.md` | This document |
+### `dataloader.py` — data pipeline
+
+* **`TransformedSubset(base_dataset, indices, transform=None)`** — a `Dataset` view over a `FolderImageDataset`. It stores the parent dataset and a list of indices; `__getitem__` looks up `base_dataset.samples[indices[idx]]`, opens the image with `Image.open(path).convert("RGB")`, applies its own `transform` and returns `(image, label)`. Its docstring explains why it exists: the yawn split is built from one listing, but the train and test halves must see different transform pipelines; sharing one dataset with a single transform would silently apply training augmentation to the test half.
+* **`FolderImageDataset(class0_dir, class1_dir, transform=None)`** — globs `*.*` in each of two directories, labelling class 0 and class 1, and stores `(path, label)` pairs in `self.samples`. `__len__` returns the sample count; `__getitem__` opens/convert-to-RGB/applies the transform.
+* **`get_transforms(img_size=(64, 64), augment=True)`** — returns `(train_tf, test_tf)`. With `augment=True` the training pipeline is `Resize -> RandomRotation(15) -> RandomHorizontalFlip -> ColorJitter(brightness=0.2) -> ToTensor`; without it, `Resize -> ToTensor`. The test pipeline is always `Resize -> ToTensor`.
+* **`get_loaders(dataset_type="both", img_size=(64, 64), batch_size=32, augment=True)`** — builds `ImageFolder` train/test datasets for the eye data, builds the yawn dataset with `FolderImageDataset("no yawn", "yawn")`, computes an 80/20 split length, uses `random_split(range(len(yawn_full)), [...])`, wraps the halves in `TransformedSubset` with `train_tf` / `test_tf`, and returns the configured `DataLoader` objects.
+* **Synthetic sequence dataset** — a `Dataset` whose `__init__(self, num_samples=500, seq_len=10, feature_dim=4)` generates synthetic feature sequences (default 500 samples, 10 time steps, 4 features each) with `__len__` and `__getitem__` returning `(sequence, label)`.
+* **`get_sequence_loader(batch_size=32)`** — wraps that synthetic sequence dataset in a `DataLoader` used by the temporal training path, matching the `(B, T=10, F=4)` input expected by `models_temporal.py`.
+
+### `models_cnn.py` — image models and detection head
+
+All models output a sigmoid probability with `num_classes=1` by default.
+
+* **`ResidualBlock(in_c, out_c)`** — two `3x3` convolutions with `BatchNorm2d`, a ReLU between them, and a shortcut: an empty `nn.Sequential()` when `in_c == out_c`, otherwise a `1x1` convolution + `BatchNorm2d`. `forward` adds the shortcut to the residual branch and applies `F.relu`.
+* **`ResNet(num_classes=1)`** — an initial `Conv2d(3, 32, kernel_size=7, stride=2, padding=3) + BatchNorm2d + ReLU`, then `ResidualBlock(32, 32)`, `ResidualBlock(32, 64)`, `AdaptiveAvgPool2d((1, 1))`, `flatten`, and a `Linear(64, num_classes)` followed by `torch.sigmoid`.
+* **`InceptionBlock(in_c, f1, f2, f3)`** — four parallel branches: `1x1` conv (`f1` channels), `3x3` conv (`f2`, padding 1), `5x5` conv (`f3`, padding 2), and `MaxPool2d(3, stride=1, padding=1)` followed by a `1x1` conv (`f1`). Each branch is ReLU-activated and the outputs are concatenated along the channel dimension.
+* **`GoogLeNet(num_classes=1)`** — `Conv2d(3, 32, 3, padding=1)` + ReLU, one `InceptionBlock(32, 16, 16, 16)`, `AdaptiveAvgPool2d((1, 1))`, flatten, and `Linear(16 * 4, num_classes)` + sigmoid.
+* **`CNN2D(use_bn=True, dropout=0.5, init_type="he")`** — the configurable baseline used by the ablation study: a `3x3` conv to 32 channels with `BatchNorm2d` (or `nn.Identity()` when `use_bn=False`), a second `3x3` conv to 64 channels with `BatchNorm2d` (or identity), followed by pooling, dropout and a classification head; it accepts `dropout` and `init_type` so `train.train_ablation_cnn` can vary them.
+* **`CNN3D`** — a 3D-convolution variant for spatio-temporal input, used for clip-level (rather than single-frame) classification.
+* **`YOLOHead`** — a detection-style head that predicts per-location objectness/class scores, i.e. a YOLO-shaped output tensor rather than a single image-level probability.
+* **`focal_loss(...)`** — a focal-loss helper that down-weights easy examples, intended for the class imbalance between alert and drowsy frames.
+
+### `models_temporal.py` — sequence models
+
+* **Activation helpers** — `step_activation(x)` returns `(x >= 0.0).float()`; `sigmoid_activation(x)` returns `torch.sigmoid(x)`; `tanh_activation(x)` returns `torch.tanh(x)`. These expose the three classic activation shapes used when discussing the classical neurons.
+* **`TemporalRNN(input_dim=4, hidden_dim=32, num_classes=1)`** — an `nn.RNN(input_dim, hidden_dim, batch_first=True, nonlinearity="tanh")`; `forward` keeps only `h_n`, squeezes the layer dimension, applies `Linear(hidden_dim, num_classes)` and returns a sigmoid.
+* **`TemporalLSTM(input_dim=4, hidden_dim=32, num_classes=1)`** — an `nn.LSTM(input_dim, hidden_dim, batch_first=True)`, then `Dropout(0.2)`, then `Linear(hidden_dim, num_classes)` and a sigmoid, again using the final hidden state `h_n`.
+
+Both consume batch-first tensors of shape `(B, T=10, F=4)`, which is exactly what `dataloader.get_sequence_loader` produces.
+
+### `models_vae.py` — variational auto-encoder
+
+* **`VAE(latent_dim=16)`** — encoder: `Conv2d(3, 32, 4, stride=2, padding=1)` + ReLU, `Conv2d(32, 64, 4, stride=2, padding=1)` + ReLU, `Flatten`, then two linear heads `fc_mu` and `fc_logvar` from `64 * 16 * 16` to `latent_dim`. Decoder: `decoder_fc` maps `latent_dim` back to `64 * 16 * 16` and is reshaped to `(-1, 64, 16, 16)`, followed by `ConvTranspose2d(64, 32, 4, stride=2, padding=1)` + ReLU and `ConvTranspose2d(32, 3, 4, stride=2, padding=1)` + `Sigmoid`.
+* **`reparameterize(mu, logvar)`** — the standard re-parameterisation trick: `std = exp(0.5 * logvar)`, `eps = randn_like(std)`, return `mu + eps * std`.
+* **`forward(x)`** — encodes, computes `mu`/`logvar`, samples `z`, decodes, and returns `(recon_x, mu, logvar)`.
+* **`generate(num_samples=5, device="cpu")`** — samples `z = randn(num_samples, latent_dim)` on the given device and runs the decoder to produce new images.
+* **`vae_loss_fn(recon_x, x, mu, logvar)`** — `binary_cross_entropy(recon_x, x, reduction="sum")` plus the analytic KL term `-0.5 * sum(1 + logvar - mu^2 - exp(logvar))`, normalised by `x.size(0)`. The `Sigmoid` output layer matches this BCE reconstruction loss.
+
+### `paradigms.py` — classical learning rules
+
+These are self-contained tensor utilities, not `nn.Module`s, and are not imported by `train.py`; they exist as reference implementations of classical rules.
+
+* **`hebbian_update(weights, x, y, lr=0.01)`** — returns `weights + lr * outer(y, x)`.
+* **`ojas_update(weights, x, y, lr=0.01)`** — normalised Hebbian rule with the Oja decay term `(y ** 2).unsqueeze(1) * weights`, i.e. `weights + lr * (outer(y, x) - decay)`.
+* **`competitive_learning(weights, x, lr=0.1)`** — computes `norm(weights - x, dim=1)`, picks `argmin` (the winning unit), moves it towards `x` by `lr`, and returns `(weights, winner_idx)`.
+* **`error_correction_update(weights, bias, x, y_true, lr=0.05)`** — a perceptron-style rule: predicts `1.0` if `dot(weights, x) + bias >= 0` else `0.0`, computes `error = y_true - y_pred`, then updates `weights += lr * error * x` and `bias += lr * error`; returns `(weights, bias, error)`.
+* **`energy_function(x, weights, bias)`** — `-0.5 * x^T W x - b^T x`, the Hopfield-style energy.
+* **`energy_based_update(weights, bias, pos_data, neg_data, lr=0.01)`** — contrastive update `weights += lr * (outer(pos, pos) - outer(neg, neg))`, `bias += lr * (pos - neg)`.
+
+### `train.py` — training loops
+
+* **`get_optimizer(model, opt_name="adam", lr=0.001, l2=0.0)`** — optimizer factory used to drive ablations: `"sgd"` -> `optim.SGD(lr, weight_decay=l2)`, `"momentum"` -> SGD with `momentum=0.9`, `"nesterov"` -> SGD with `momentum=0.9, nesterov=True`, and Adam as the default fallback.
+* **`train_ablation_cnn(dataset_type="both", opt_name="adam", use_bn=True, dropout=0.5, l2=0.001, init_type="he", augment=True, epochs=3)`** — selects CUDA when available, calls `get_loaders`, builds `CNN2D(use_bn, dropout, init_type)`, builds the optimizer via `get_optimizer(lr=0.001, l2=l2)`, uses `nn.BCELoss`, and per epoch runs the standard train loop: move images and `labels.float().unsqueeze(1)` to the device, zero gradients, forward, loss, backward, step; accumulates loss and accuracy (threshold `> 0.5`) and prints epoch loss/accuracy. Returns the trained model.
+* **`train_temporal(epochs=5)`** — gets the sequence loader, builds `TemporalLSTM`, optimises with Adam (`lr=0.001`) and `BCELoss`, and prints the mean loss per epoch.
+* **`train_vae(dataset_type="both", epochs=3)`** — gets loaders without augmentation, builds `VAE` with Adam (`lr=0.001`) and uses `vae_loss_fn` (imported from `models_vae.py`) as the objective in the training loop.
+
+Note the consistent contract: every classifier ends in `sigmoid`, `BCELoss` is used, and labels are reshaped to `(B, 1)` so they match the model output.
+
+### `evaluate.py` — measurement
+
+* **`evaluate_model(model, test_loader, device="cpu")`** — `model.eval()`, iterates the loader under `torch.no_grad()`, thresholds outputs at `0.5` (`(outputs > 0.5).int()`), flattens to NumPy, accumulates truth/prediction lists, and returns a dict with `accuracy`, `precision`, `recall`, `f1` (all sklearn, `zero_division=0`) and the `confusion_matrix`.
+* **`benchmark_fps(model, input_shape=(1, 3, 64, 64), num_runs=50, device="cpu")`** — creates a random dummy input, runs 5 warm-up passes, times `num_runs` forward passes under `no_grad`, and returns `{"fps": num_runs / elapsed, "latency_ms": elapsed / num_runs * 1000}`.
+* **`compute_perclos(eye_states, threshold=0.8)`** — counts entries equal to `0` (closed eyes), divides by the sequence length to get the PERCLOS ratio, and reports `is_drowsy = perclos >= threshold`.
+* **`__main__`** — instantiates `ResNet` and `GoogLeNet`, prints their `benchmark_fps` results; useful as a quick sanity/throughput check on a machine with torch installed.
+
+### `benchmark.py` — standalone benchmark harness
+
+A self-contained script that can be copied to a machine with PyTorch; it never imports torch at module import time, so `--dry-run` works without the heavy dependency.
+
+* **`_import_torch()`** — returns the torch module or `None`; `INSTALL_HINT` holds the CPU-wheel install instructions printed when torch is missing.
+* **`MODEL_SPECS`** — a list of dicts registering only models that actually exist in `models_cnn.py`: `CNN2D` (with `use_bn=True, dropout=0.5, init_type="he"`, mirroring `train.py`), `ResNet`, `GoogLeNet`.
+* **`build_model(torch, name, kwargs)`** — imports `models_cnn` lazily and instantiates `getattr(models_cnn, name)(**kwargs)`, returning `None` for unknown names.
+* **CLI** — `--dry-run` (wiring check without torch), `--batch-size`, `--runs` (inference FPS / latency on a `(batch, 3, 64, 64)` input), `--train-steps` (times real `CNN2D` optimisation steps with BCE loss and labels shaped `(B, 1)` as in `train.py`), and `--json` (dump a machine-readable report). It prints a table and optionally writes JSON.
+
+### `run_training.py` — standalone training launcher
+
+* **`_import_torch()`** — lazy torch import; `INSTALL_HINT` explains that TensorFlow is not used by this repo (every model is PyTorch) and gives the CPU-wheel install command.
+* **`_check_data_dirs()`** — checks for the four image folders the dataloader expects (`train`, `test`, `no yawn`, `yawn`) and returns `(expected, missing)`.
+* **`dry_run()`** — validates wiring without torch or data: prints the Python version, torch availability (and CUDA availability if torch exists), the expected/missing data dirs, and uses `importlib.util` to check that `train`, `dataloader`, `models_cnn`, `models_temporal`, `models_vae` are importable by name (importing `train.py` directly would import torch at module level).
+* **CLI** — `--dry-run` (wiring check), `--model cnn` (calls `train.train_ablation_cnn`), `--model temporal` (calls `train.train_temporal`), `--model vae` (calls `train.train_vae`).
+
+### `requirements.txt`
+
+Lists the actual runtime dependencies: `torch`, `torchvision`, `Pillow`, `numpy`, `scikit-learn`. Comments document the CPU-only torch install command and note that torch/torchvision are large and must be installed on a machine with enough RAM/disk; the harness scripts degrade gracefully when PyTorch is missing.
 
 ---
 
-## 4. File-by-file implementation details
+## 4. How to run
 
-### 4.1 `dataloader.py` — data ingestion
-
-**`FolderImageDataset(Dataset)`** — a generic two-folder binary dataset.
-
-- `__init__(class0_dir, class1_dir, transform=None)` globs `*.*` inside each directory and appends `(path, label)` pairs, with label **0** for `class0_dir` and **1** for `class1_dir`.
-- `__len__` returns the number of collected files.
-- `__getitem__(idx)` opens the file with Pillow, **forces `RGB`** (three channels — required by every CNN in the repo, which all start with a 3-channel convolution), applies the transform if present, and returns `(image, label)`.
-
-**`get_transforms(img_size=(64, 64), augment=True)`** returns a `(train_tf, test_tf)` pair.
-
-- With `augment=True` the training pipeline is `Resize(img_size) → RandomRotation(15) → RandomHorizontalFlip() → ColorJitter(brightness=0.2) → ToTensor()`.
-- With `augment=False` it is only `Resize(img_size) → ToTensor()`.
-- `test_tf` is always `Resize(img_size) → ToTensor()` (no augmentation, no normalization).
-- Because there is **no `Normalize`** step, inputs stay in `[0, 1]`; this is consistent with the VAE decoder, which ends in `Sigmoid`, and with `BCELoss` targets of 0/1.
-
-**`get_loaders(dataset_type="both", img_size=(64, 64), batch_size=32, augment=True)`** is the main data entry point.
-
-1. Builds `eye_train = ImageFolder("train", transform=train_tf)` and `eye_test = ImageFolder("test", transform=test_tf)` — the eye-state data uses torchvision's folder convention with `train/` and `test/` directories on disk.
-2. Builds `yawn_full = FolderImageDataset("no yawn", "yawn", transform=train_tf)` — note the yawn data uses two flat folders.
-3. Splits the yawn data 80/20 with `random_split(yawn_full, [yawn_train_len, yawn_test_len])`, where `yawn_train_len = int(0.8 * len(yawn_full))`.
-4. Selects the sets by `dataset_type`: `"eyes"` → eye folders only, `"yawn"` → the random split only, anything else (`"both"`, the default) → `ConcatDataset([eye_train, yawn_train])` and `ConcatDataset([eye_test, yawn_test])`.
-5. Wraps them in `DataLoader(train_set, batch_size=32, shuffle=True)` and `DataLoader(test_set, batch_size=32, shuffle=False)`.
-
-Implementation notes worth flagging:
-
-- The **yawn split uses `train_tf` for both halves**, so the yawn "test" set is *augmented*; and `random_split` consumes the global RNG, so the split differs on every run (no `generator=` and no seed).
-- Eye data has an explicit on-disk `test/` folder while yawn data is split programmatically — the two halves of `"both"` therefore have different leakage guarantees.
-- Directory arguments are **relative paths** (`"train"`, `"test"`, `"no yawn"`, `"yawn"`), so the process must be started from the project root.
-
-**`SequenceDataset(Dataset)`** — a *synthetic* sequence dataset, not real video data.
-
-- `X = torch.randn(num_samples=500, seq_len=10, feature_dim=4)` (pure Gaussian noise).
-- `y = (X[:, :, 0].mean(dim=1) > 0).float().unsqueeze(1)` — the label is the sign of the mean of the first feature over time, i.e. an exactly-learnable threshold rule on noise, giving an output shape `(B, 1)`.
-- `get_sequence_loader(batch_size=32)` wraps it in a shuffled `DataLoader`.
-
-### 4.2 `models_cnn.py` — convolutional models
-
-All image models take `(B, 3, H, W)` input (64×64 with the default transforms) and end in a `Sigmoid` producing a single probability per sample, matching the `BCELoss` used in `train.py` with `num_classes=1`.
-
-**`ResidualBlock(in_c, out_c)`** — two 3×3 convolutions with `padding=1`, each followed by `BatchNorm2d`, plus a projection shortcut (`1×1` conv + `BatchNorm2d`) that is only created when `in_c != out_c`. `forward` computes `res = shortcut(x)`, then `relu(bn1(conv1(x))) → bn2(conv2(...))`, and returns `relu(out + res)`.
-
-**`ResNet(num_classes=1)`** — a deliberately small hand-written ResNet: `init_conv` = `Conv2d(3, 32, k=7, stride=2, padding=3) → BatchNorm2d(32) → ReLU`, then `block1 = ResidualBlock(32, 32)`, `block2 = ResidualBlock(32, 64)`, `AdaptiveAvgPool2d((1,1))`, `Linear(64, num_classes)`, and `sigmoid` on the output. Downsampling happens only through the stride-2 stem and the global pooling — there are no max-pool stages.
-
-**`InceptionBlock(in_c, f1, f2, f3)`** — four parallel branches: a 1×1 conv (`f1`), a 3×3 conv with padding 1 (`f2`), a 5×5 conv with padding 2 (`f3`), and a `MaxPool2d(k=3, stride=1, padding=1)` followed by a 1×1 conv (`f1`). Each branch is ReLU-activated and the four outputs are concatenated along the channel dimension with `torch.cat([...], dim=1)`.
-
-**`GoogLeNet(num_classes=1)`** — a single-Inception-block network: `Conv2d(3, 32, k=3, padding=1) → ReLU → InceptionBlock(32, 16, 16, 16) → AdaptiveAvgPool2d((1,1)) → Linear(16*4, num_classes) → sigmoid`. The classifier input of `16*4 = 64` follows from the concatenation of the four branches (16+16+16+16). It is a very shallow "Inception-style" model, not the original deep GoogLeNet.
-
-**`CNN2D(use_bn=True, dropout=0.5, init_type="he")`** — the configurable model used for all ablations. Modules: `Conv2d(3, 32, k=3, padding=1)`, `BatchNorm2d(32)` (or `nn.Identity()` when `use_bn=False`), `Conv2d(32, 64, k=3, padding=1)`, `BatchNorm2d(64)`, a `Dropout(dropout)` (or `Identity` when `dropout <= 0`), `AdaptiveAvgPool2d((4, 4))`, `Linear(64*4*4, 32)`, and `Linear(32, 1)`. It exposes three ablation switches — normalization, dropout, and weight initialization — which are set by `_init_weights(init_type)`: `nn.Conv2d`/`nn.Linear` weights get `xavier_uniform_` for the `"xavier"` path and `kaiming_normal_(nonlinearity="relu")` otherwise (`"he"`), and every bias is zero-initialized.
-
-**`CNN3D(num_classes=1)`** — a volumetric/spatio-temporal model: `Conv3d(3, 16, k=(3,3,3), padding=1)`, `Conv3d(16, 32, k=(3,3,3), padding=1)`, `AdaptiveAvgPool3d((1,1,1))`, `Linear(32, num_classes)`. It expects a 5-D tensor `(B, C, T, H, W)` rather than a single image.
-
-**`YOLOHead(in_c=64, num_classes=3, num_anchors=2)`** — a single detection head implemented as `Conv2d(in_c, num_anchors * (5 + num_classes), kernel_size=1)`, i.e. `2 * (5 + 3) = 16` output channels per spatial location following the YOLO convention (`5` = box `x, y, w, h` + objectness). It is a building block only; there is no matching backbone, anchor assignment, or detection loss in the repository.
-
-**`focal_loss(preds, targets, alpha=0.25, gamma=2.0)`** — a helper implementing focal loss (down-weighting easy examples via `(1 - p_t)^gamma` scaled by `alpha`). It is defined in this module but is **not imported anywhere** — `train.py` uses plain `nn.BCELoss()`.
-
-### 4.3 `models_temporal.py` — sequence models
-
-Three activation helpers are defined for reference / experimentation: `step_activation` (binary threshold `(x >= 0).float()`), `sigmoid_activation`, and `tanh_activation`.
-
-**`TemporalRNN(input_dim=4, hidden_dim=32, num_classes=1)`** — an `nn.RNN(..., batch_first=True, nonlinearity="tanh")` followed by `Linear(hidden_dim, num_classes)`. `forward` runs the sequence, keeps only the final hidden state `h_n`, squeezes the layer axis, applies the linear layer and a `sigmoid`. Input shape: `(B, T, 4)`.
-
-**`TemporalLSTM(input_dim=4, hidden_dim=32, num_classes=1)`** — `nn.LSTM(batch_first=True)`, then `Dropout(0.2)` on the final hidden state `h_n`, then `Linear(hidden_dim, num_classes)` and `sigmoid`. Only the last hidden state is used (no attention, no per-timestep output). These feature sequences have the same 4-dimensional signature as `SequenceDataset`, i.e. the intended per-frame features are 4-D. Note that the LSTM does **not** set `input_size=...` from the constructor's `input_dim` positionally but forwards it correctly as the first positional argument.
-
-### 4.4 `models_vae.py` — variational autoencoder
-
-**`VAE(latent_dim=16)`**
-
-- **Encoder:** `Conv2d(3, 32, k=4, s=2, p=1) → ReLU → Conv2d(32, 64, k=4, s=2, p=1) → ReLU → Flatten`.
-- **Latent heads:** `fc_mu` and `fc_logvar`, both `Linear(64*16*16, latent_dim)`. This fixes the input resolution at **64×64** (two stride-2 convolutions turn 64→32→16, and `64 * 16 * 16 = 16384` features). Any other resolution will raise a shape error.
-- **Decoder:** `decoder_fc = Linear(latent_dim, 64*16*16)`, reshaped with `.view(-1, 64, 16, 16)`, then `ConvTranspose2d(64, 32, k=4, s=2, p=1) → ReLU → ConvTranspose2d(32, 3, k=4, s=2, p=1) → Sigmoid` (64×64 RGB output in `[0, 1]`).
-- **`reparameterize(mu, logvar)`** — the standard reparameterization trick: `std = exp(0.5*logvar)`, `eps ~ N(0, I)`, `z = mu + eps*std`.
-- **`forward(x)`** returns the triple `(recon_x, mu, logvar)`.
-- **`generate(num_samples=5, device="cpu")`** samples `z ~ N(0, I)` of width `self.fc_mu.out_features` and decodes it — the sampling path for new faces/eye images.
-
-**`vae_loss_fn(recon_x, x, mu, logvar)`** — `F.binary_cross_entropy(recon_x, x, reduction="sum")` plus the analytic KL term `-0.5 * sum(1 + logvar - mu^2 - exp(logvar))`, divided by the batch size `x.size(0)`. The BCE is *summed over pixels* while the KL is summed over latent units, so in practice the reconstruction term dominates early in training unless it is rescaled.
-
-### 4.5 `paradigms.py` — classical learning rules
-
-Standalone, framework-free tensor utilities (not imported by `train.py`):
-
-- **`hebbian_update(weights, x, y, lr=0.01)`** — `W + lr * outer(y, x)` (plain Hebbian potentiation).
-- **`ojas_update(weights, x, y, lr=0.01)`** — Hebbian term minus a decay term `(y²) * W`, keeping weight norms bounded (Oja's rule).
-- **`competitive_learning(weights, x, lr=0.1)`** — computes the Euclidean distance of the input to every prototype row, picks `argmin` (winner-take-all), moves that prototype toward the input with `lr * (x - w_winner)`, and returns `(weights, winner_index)`. The prototype row is updated **in place**.
-- **`error_correction_update(weights, bias, x, y_true, lr=0.05)`** — a perceptron step: predict `1` if `dot(w, x) + b >= 0` else `0`, compute `error = y_true - y_pred`, and apply `w += lr*error*x`, `b += lr*error`. Returns `(weights, bias, error)`.
-- **`energy_function(x, weights, bias)`** — the Hopfield-style quadratic energy `-0.5 * xᵀ W x - bᵀ x`.
-- **`energy_based_update(weights, bias, pos_data, neg_data, lr=0.01)`** — contrastive Hebbian update using the outer products of positive vs. negative samples, `W += lr*(outer(pos,pos) - outer(neg,neg))` and `b += lr*(pos - neg)`.
-
-### 4.6 `train.py` — training orchestration
-
-**`get_optimizer(model, opt_name="adam", lr=0.001, l2=0.0)`** — an optimizer factory used by the ablations:
-
-| `opt_name` | Optimizer |
-| --- | --- |
-| `"sgd"` | `SGD(lr, weight_decay=l2)` |
-| `"momentum"` | `SGD(lr, momentum=0.9, weight_decay=l2)` |
-| `"nesterov"` | `SGD(lr, momentum=0.9, nesterov=True, weight_decay=l2)` |
-| anything else (default) | `Adam(lr, weight_decay=l2)` |
-
-**`train_ablation_cnn(dataset_type="both", opt_name="adam", use_bn=True, dropout=0.5, l2=0.001, init_type="he", augment=True, epochs=3)`** — the main training loop.
-
-1. Selects CUDA when available, otherwise CPU.
-2. Builds loaders via `get_loaders(dataset_type, augment)` and the model `CNN2D(use_bn, dropout, init_type)`; optimizer via `get_optimizer(..., lr=0.001, l2=l2)`; loss `nn.BCELoss()`.
-3. For each epoch: `model.train()`, move `images` and `labels.float().unsqueeze(1)` to the device, zero gradients, forward, compute loss, backward, step.
-4. Accumulates loss and computes **train accuracy** by thresholding `outputs > 0.5` and comparing with the labels; prints `Epoch [i/epochs] Loss: … Acc: …`.
-5. Returns the trained model (no checkpoint is written to disk).
-
-The `opt_name`/`use_bn`/`dropout`/`l2`/`init_type`/`augment` arguments make this function a ready-made ablation harness — each call varies one design decision of the same architecture.
-
-**`train_temporal(epochs=5)`** — builds the synthetic sequence loader, a `TemporalLSTM`, `Adam(lr=0.001)` and `BCELoss`; each epoch runs the standard forward/loss/backward/step and prints the mean loss. No evaluation is performed.
-
-**`train_vae(dataset_type="both", epochs=3)`** — builds loaders with `augment=False` (reconstruction targets must be un-augmented), instantiates `VAE()` and `Adam(lr=0.001)`, then runs the reconstruction loop using `vae_loss_fn`. The VAE is trained on both classes of the same folders, i.e. it models the *distribution* of the eye/yawn patches rather than the label.
-
-### 4.7 `evaluate.py` — measurement
-
-**`evaluate_model(model, test_loader, device="cpu")`** — runs `model.eval()` under `torch.no_grad()`, thresholds outputs at `0.5`, flattens to 1-D, and returns a dict with `accuracy`, `precision`, `recall`, `f1` (all with `zero_division=0`) and the `confusion_matrix` from scikit-learn. Labels are taken from the loader's second element, so it works directly with the loaders from `dataloader.py`.
-
-**`benchmark_fps(model, input_shape=(1, 3, 64, 64), num_runs=50, device="cpu")`** — runs 5 warm-up forward passes on a random dummy input, then times `num_runs` forward passes with `time.time()`, returning `{"fps": num_runs/elapsed, "latency_ms": elapsed/num_runs*1000}`.
-
-**`compute_perclos(eye_states, threshold=0.8)`** — PERCLOS-style drowsiness rule: `closed_frames = sum(eye_states == 0)`, `perclos = closed_frames / len(eye_states)`, and `is_drowsy = perclos >= threshold`. It expects a sequence of 0/1 eye states where `0` means *closed*.
-
-**`__main__`** — instantiates `ResNet()` and `GoogLeNet()` and prints their FPS benchmarks on CPU, e.g.:
+Heavy dependencies (`torch`, `torchvision`) cannot be installed in a restricted 512 MB / 1 CPU / no-network / no-GPU sandbox, and **TensorFlow is not used by this repo at all**. Run the following on a dedicated machine:
 
 ```bash
-python evaluate.py
+pip install -r requirements.txt \
+  --extra-index-url https://download.pytorch.org/whl/cpu   # CPU-only torch
+
+# wiring checks (no torch needed)
+python benchmark.py --dry-run
+python run_training.py --dry-run
+
+# inference throughput / latency
+python benchmark.py --batch-size 8 --runs 50
+python benchmark.py --train-steps 20 --json bench.json   # + timed training steps
+
+# training (expects the train/ test/ "no yawn"/ yawn/ image folders)
+python run_training.py --model cnn
+python run_training.py --model temporal
+python run_training.py --model vae
 ```
 
-*(`get_loaders` is imported in this module but is not used by the current `__main__` block.)*
-
----
-
-## 5. How to use the code
-
-Data is expected in the project root, **before** running anything:
+Expected on-disk layout for `dataloader.get_loaders`:
 
 ```text
-train/      # eyes, ImageFolder layout: train/open/*.png, train/closed/*.png
-test/       # eyes, ImageFolder layout: test/open/*.png,  test/closed/*.png
-no yawn/    # flat folder, label 0
-yawn/       # flat folder, label 1
+train/      # ImageFolder layout, eye-state classes
+test/       # ImageFolder layout, eye-state classes
+no yawn/    # class 0 images for the yawn split
+yawn/       # class 1 images for the yawn split
 ```
 
-Training (called directly from Python, since these are plain functions):
-
-```python
-from train import train_ablation_cnn, train_temporal, train_vae
-from evaluate import evaluate_model
-
-model = train_ablation_cnn(dataset_type="both", opt_name="nesterov",
-                           use_bn=True, dropout=0.5, l2=0.001,
-                           init_type="he", augment=True, epochs=3)
-
-from dataloader import get_loaders
-_, test_loader = get_loaders(dataset_type="both", augment=False)
-print(evaluate_model(model, test_loader))
-```
-
-Benchmarking:
-
-```bash
-python evaluate.py
-```
-
-Ablation grid (one factor at a time): `dataset_type ∈ {eyes, yawn, both}` × `opt_name ∈ {sgd, momentum, nesterov, adam}` × `use_bn ∈ {True, False}` × `dropout ∈ {0.0, 0.5}` × `l2 ∈ {0.0, 0.001}` × `init_type ∈ {he, xavier}` × `augment ∈ {True, False}`.
+The temporal path uses a synthetic sequence dataset (500 samples, 10 time steps, 4 features) so it can run without a sequence dataset on disk.
 
 ---
 
-## 6. Will the model overfit?
+## 5. Design notes and known gaps
 
-Short answer: **it can, and with the current scripts you would not be able to tell.** Here is the grounded analysis, split by model family.
-
-### 6.1 What the defaults already do to fight overfitting
-
-`CNN2D` — the model used by the ablation harness — is the most regularized model in the repo:
-
-- **Dropout 0.5** before the classifier (`nn.Dropout(dropout)`, default `0.5`).
-- **BatchNorm** on both conv blocks (default `use_bn=True`).
-- **L2 weight decay** `0.001` (`get_optimizer(..., weight_decay=l2)`).
-- **He/Kaiming initialization** (`init_type="he"`), with a Xavier alternative.
-- **Data augmentation** in `get_transforms` — `RandomRotation(15)`, `RandomHorizontalFlip`, `ColorJitter(brightness=0.2)`.
-- **Aggressive downsampling of the feature map** — `AdaptiveAvgPool2d((4, 4))` then `Linear(64*4*4 → 32) → Linear(32 → 1)`, so the trainable head is tiny (≈ 33 K weights in `fc1`) and the whole model is small.
-- **Only 3 epochs** by default.
-
-That combination — small model, small head, 3 epochs, dropout 0.5, augmentation, weight decay — makes catastrophic overfitting **unlikely**; if anything the more common failure mode here is **underfitting** (a 32-unit head after a 4×4 global-avg pool is a very narrow bottleneck).
-
-### 6.2 Where overfitting is still likely
-
-1. **The generalization gap is never measured during training.** `train_ablation_cnn` evaluates *only* the training set (`acc = correct / total` inside the training loop) and never touches `test_loader` — the loader it receives but only unpacks and discards (`train_loader, test_loader = get_loaders(...)`; `test_loader` is never used). There is no validation split, no per-epoch test metric, no early stopping, and no saved best checkpoint. So even if the model overfits, nothing in the run reports it.
-2. **Small datasets + heavy augmentation = augmented-only validation.** For the yawn half of `"both"`, `get_loaders` applies `train_tf` to `yawn_full` *before* the 80/20 `random_split`, so the "test" yawn images are randomly rotated/flipped/brightness-jittered too. Reported test accuracy on those samples is neither clean nor comparable across runs.
-3. **Non-repeatable splits.** `random_split` uses the global RNG with no `generator=` and there is no `torch.manual_seed(...)` anywhere, so the yawn train/test split changes per run — metrics are not reproducible, and a lucky split can look like a good model.
-4. **Potential identity leakage between the eye halves.** The eye data relies on `train/` and `test/` being genuinely disjoint on disk (per-driver/per-session). The code does not verify this; if frames from the same video end up on both sides, the reported accuracy will be optimistic regardless of architecture.
-5. **Class imbalance is unhandled.** `FolderImageDataset` and `ImageFolder` count whatever files exist; there is no `WeightedRandomSampler`, no `pos_weight`, and `BCELoss` is unweighted. With `nofault`-heavy folders, accuracy is dominated by the majority class — `precision`/`recall`/`F1` in `evaluate_model` exist precisely to expose this, but nothing in training optimizes for it.
-
-### 6.3 Per-model verdict
-
-| Model | Overfitting risk | Reasoning from the code |
-| --- | --- | --- |
-| `CNN2D` | **Low to moderate** | Dropout 0.5 + BN + weight decay 0.001 + augmentation + tiny `fc1`/`fc2` head + 3 epochs. Risk rises if `dropout=0.0`, `augment=False` and `l2=0.0` are chosen in the ablation grid — that configuration is effectively unregularized and *will* overfit on a small set. |
-| `ResNet` | **Low (capacity-limited)** | Only two residual blocks, 32/64 channels, a single global-average-pool, and a `Linear(64 → 1)` head. Very few parameters and **no dropout**; the realistic failure mode is underfitting, not overfitting. |
-| `GoogLeNet` | **Low (capacity-limited)** | One Inception block, no batch-norm, no dropout, and a `Linear(64 → 1)` classifier fed by global average pooling. Again, underfitting is the more likely failure. |
-| `TemporalRNN` / `TemporalLSTM` | **Meaningless on the current data** | Trained on `SequenceDataset`, which is i.i.d. Gaussian noise with a threshold label. There is no real temporal signal to memorize beyond the `mean(feature 0) > 0` rule, so the model converges to a near-trivial decision boundary; the LSTM's `Dropout(0.2)` and 32-unit hidden state are far more than that rule needs. Any reported loss is not evidence about driving behaviour. |
-| `CNN3D` | **Untested** | Three conv layers/16→32 channels and a `Linear(32 → 1)` head. There is no 3-D dataloader in the repo, so it cannot currently be trained at all — overfitting is moot until video tensors exist. |
-| `VAE` | **Moderate to high (memorization)** | A 16-D latent for 64×64 RGB patches is a strong bottleneck, which limits memorization; however the loss is `sum(BCE)/batch + KL`, which is dominated by the reconstruction term, so the model can under-regularize its KL and behave close to a plain autoencoder (memorizing the training frames). Nothing monitors the ELBO on held-out images. |
-| `paradigms.py` rules | **N/A** | Pure tensor update rules; they are never trained by the pipeline. |
-
-### 6.4 Concrete recommendations
-
-1. Add a **validation split** and log train **and** validation loss/F1 every epoch; the code already returns the model, so `evaluate_model` can be called on a validation loader between epochs.
-2. Add `torch.manual_seed(...)` and pass `generator=torch.Generator().manual_seed(seed)` to `random_split` for reproducible, comparable ablations.
-3. Use `test_tf` for the yawn test half — split the **dataset paths first**, then apply the train transform to the train subset only.
-4. Track the **gap** `train_acc − test_f1` across the ablation grid; a widening gap is the overfitting signal the current instrumentation is missing.
-5. Consider class weighting (`pos_weight`) or a weighted sampler if the eye/yawn folders are imbalanced, and report precision/recall/F1 rather than accuracy alone.
-6. For the VAE, weight the KL term (e.g. β-VAE) or normalize BCE per pixel, and monitor reconstruction error on unseen frames.
-
----
-
-## 7. Known limitations and caveats
-
-- **No dependencies manifest.** Install manually: `torch`, `torchvision`, `Pillow`, `numpy`, `scikit-learn`.
-- **No tests, no CI, no seeding, no checkpointing, no logging framework.** All hyperparameters are function defaults.
-- **`train.py` exposes functions only** — there is no top-level `argparse`/CLI, so experiments are driven from a Python REPL or a driver script.
-- **`focal_loss` in `models_cnn.py` is dead code** (never imported); every training loop uses `nn.BCELoss()`.
-- **`YOLOHead` has no backbone, anchors, or detection loss**, and `CNN3D` has no 3-D data loader — both are building blocks for future work.
-- **`benchmark_fps` does not call `torch.cuda.synchronize()`**, so on GPU the reported FPS/latency is measured asynchronously and can be optimistic.
-- **`compute_perclos` uses a default threshold of `0.8`** (80 % of frames closed) and counts `eye_states == 0` as closed; both the convention and the threshold must match the eye-classifier's label convention (`ImageFolder` sorts folders alphabetically, so "closed" vs "open" ordering determines which label means closed).
-- **Input-resolution coupling:** the VAE hard-codes 64×64; the CNNs adapt via pooling but were designed around `img_size=(64, 64)`.
-- **`evaluate.py` imports `get_loaders` but `__main__` only benchmarks models.**
-- **No normalization layer** in the transforms — inputs stay in `[0, 1]`, which the sigmoid-output models and the VAE reconstruction loss assume.
+* **Single-output sigmoid classifiers.** Every classifier ends in `sigmoid` with `num_classes=1`, so training uses `BCELoss` and labels are reshaped with `unsqueeze(1)`; evaluation thresholds at `0.5`.
+* **Transform isolation.** `TransformedSubset` exists specifically to keep training augmentation out of the test half of the yawn split.
+* **Device selection** is `cuda` if available, otherwise `cpu`, in every training function in `train.py`.
+* **No checkpointing / logging infrastructure.** Models are returned from the training functions in memory; there is no `save`/`load`, no TensorBoard, no config file.
+* **No test suite.** Validation is manual (`benchmark.py --dry-run`, `run_training.py --dry-run`, and the `evaluate.py` `__main__` block).
+* **No CI workflows.** Benchmark and training automation are deliberately delivered as normal scripts (`benchmark.py`, `run_training.py`) plus this README note, instead of files under `.github/workflows/`.
