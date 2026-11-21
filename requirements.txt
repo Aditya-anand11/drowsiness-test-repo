@@ -1,0 +1,14 @@
+# Drowsiness-detection research codebase dependencies.
+#
+# NOTE: torch / torchvision are large (hundreds of MB). Install them on a
+# dedicated machine or a machine with enough RAM/disk; the benchmark harness
+# degrades gracefully and prints instructions when PyTorch is missing.
+#
+# CPU-only install of torch:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+
+torch
+torchvision
+Pillow
+numpy
+scikit-learn
