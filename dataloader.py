@@ -32,9 +32,9 @@ class FolderImageDataset(Dataset):
     def __init__(self, class0_dir, class1_dir, transform=None):
         self.transform = transform
         self.samples = []
-        for path in glob.glob(os.path.join(class0_dir, "*.*")):
+        for path in sorted(glob.glob(os.path.join(class0_dir, "*.*"))):
             self.samples.append((path, 0))
-        for path in glob.glob(os.path.join(class1_dir, "*.*")):
+        for path in sorted(glob.glob(os.path.join(class1_dir, "*.*"))):
             self.samples.append((path, 1))
 
     def __len__(self):
@@ -76,8 +76,14 @@ def get_loaders(dataset_type="both", img_size=(64, 64), batch_size=32, augment=T
     yawn_full = FolderImageDataset("no yawn", "yawn")
     yawn_train_len = int(0.8 * len(yawn_full))
     yawn_test_len = len(yawn_full) - yawn_train_len
+    # Use a dedicated, fixed-seed generator so the train/test split of the yawn
+    # data is reproducible and does not depend on the global (possibly unseeded)
+    # RNG state.  This keeps runs comparable and avoids an empty test half when
+    # the yawn folders are tiny.
+    split_generator = torch.Generator().manual_seed(42)
     yawn_train_split, yawn_test_split = random_split(
-        range(len(yawn_full)), [yawn_train_len, yawn_test_len]
+        range(len(yawn_full)), [yawn_train_len, yawn_test_len],
+        generator=split_generator,
     )
     yawn_train = TransformedSubset(yawn_full, yawn_train_split.indices, transform=train_tf)
     yawn_test = TransformedSubset(yawn_full, yawn_test_split.indices, transform=test_tf)
